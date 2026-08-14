@@ -63,11 +63,12 @@ def test_title_only_rule_has_empty_body():
     assert chunks[0].text == "遊戲概念"
 
 
-def test_real_sample_corpus_parses(tmp_path):
-    from pathlib import Path
+def test_real_sample_corpus_parses():
+    """Reads the shipped seed through the package rather than a repo-relative
+    path, so this no longer depends on pytest's working directory."""
+    from riftbound_bot.ingest import seeds
 
-    corpus = Path("data/rules/core_rules_zh_tw.md").read_text(encoding="utf-8")
-    chunks = parse_rules_text(corpus)
+    chunks = parse_rules_text(seeds.rules_markdown())
     ids = {c.rule_id for c in chunks}
     assert "805.1.a" in ids
     assert "809.1.c.1" in ids

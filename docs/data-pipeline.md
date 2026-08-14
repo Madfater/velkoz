@@ -1,43 +1,51 @@
 # Data pipeline
 
+**There is no local data directory.** Everything lives in Postgres — three
+tables, all in [`ingest/db.py`](../src/riftbound_bot/ingest/db.py):
+
 ```
-data/rules/core_rules_zh_tw.md   # self-translated Traditional Chinese rules corpus (authoring source)
-data/cards/cards.json            # historical snapshot only — no longer read by any code path
-data/turbovec/                   # built vector index (gitignored, rebuild with build_index)
+rules        # the hand-translated rules corpus (narrow + JSONB)
+cards        # scraped card data (narrow + JSONB)
+embeddings   # the vector index the bot serves from (pgvector)
 ```
 
-Postgres (`cards`/`rules` tables, JSONB-backed — see
-[`ingest/db.py`](../src/riftbound_bot/ingest/db.py)) sits between the raw sources
-above and the vector index: `cards_scrape.py`/`cards_from_api.py` upsert scraped
-cards directly into the `cards` table (per-record, not a whole-file replace),
-`rules_sync.py` parses `data/rules/*.md` and upserts into the `rules` table, and
-`build_index.py` reads both tables to build the vector store.
+`cards_scrape.py`/`cards_from_api.py` upsert scraped cards into `cards`
+(per-record, not a whole-file replace), `rules_import.py` parses Markdown into
+`rules`, and `build_index.py` reads both tables and writes `embeddings`.
 
-This is all ingest-time. The live bot only ever reads the already-built
-`data/turbovec/` index, never Postgres directly — see `load_vectorstore` in
+Unlike earlier versions, the live bot reads Postgres directly — the `embeddings`
+table, on every request. See `PgVectorStore` in
 [`rag/vectorstore.py`](../src/riftbound_bot/rag/vectorstore.py).
+
+Two corpora ship inside the package, at
+[`ingest/seeds/`](../src/riftbound_bot/ingest/seeds/), so a fresh environment can
+initialize with no manual step and no reachable third-party site. They are
+*seeds*, not the source of truth: bootstrap reads one only into an empty table
+and never over existing rows.
 
 The sections below describe each step individually. You don't have to run them
 by hand on a fresh deployment:
 [`ingest/bootstrap.py`](../src/riftbound_bot/ingest/bootstrap.py) chains them in
-order (rules sync → card scrape → build index) and is what `docker compose up`
-runs before starting the bot. It only fills in what's missing — it skips the card
-scrape when the `cards` table is already populated, and does nothing at all once
-`data/turbovec/` exists — so refreshing data that's already there is still a
-deliberate manual run of the steps below.
+order (rules → cards → build index) and is what `docker compose up` runs before
+starting the bot. It only fills in what's missing — it skips rules and cards when
+those tables are populated, and does nothing at all once `embeddings` has rows —
+so refreshing data that's already there is still a deliberate manual run of the
+steps below.
 
 ## Rules corpus
 
-`data/rules/core_rules_zh_tw.md` currently holds a **sample slice** — the
-Golden/Silver Rules, the start of deck construction, and two full keyword
-definitions (Accelerate/疾行, Deflect/偏斜) — translated from Riot's official Core
-Rules PDF (`playriftbound.com/en-us/rules-hub`), enough to exercise the full
-pipeline end-to-end.
+**The `rules` table is the source of truth.** The seed at
+`src/riftbound_bot/ingest/seeds/core_rules_zh_tw.md` currently holds a **sample
+slice** — the Golden/Silver Rules, the start of deck construction, and two full
+keyword definitions (Accelerate/疾行, Deflect/偏斜) — translated from Riot's
+official Core Rules PDF (`playriftbound.com/en-us/rules-hub`), enough to exercise
+the full pipeline end-to-end. It initializes an empty database and is never
+re-applied over rules already stored.
 
 The full rules book is a larger, deliberate translation task (per the design doc,
 this is meant to be an owned, terminology-consistent translation, not a fan or
 machine one). To extend it, keep transcribing rule-by-rule in the same format
-documented in the comment at the top of the file:
+documented in the comment at the top of the seed file:
 
 ```
 [<official rule id>] <optional short heading>
@@ -47,12 +55,25 @@ documented in the comment at the top of the file:
 Rule IDs are copied straight from the official PDF's own numbering (e.g.
 `103.2.d.1`), so the translation work maps 1:1 onto the source document.
 
-After editing the Markdown, sync it into Postgres (upserts by `rule_id`; prunes
-any row whose id no longer appears in the freshly parsed file):
+Markdown stays the editing format, but it's an interchange now rather than a
+directory the deployment reads — so the CLIs take explicit paths. Export what's
+stored, edit it, import it back (upserts by `rule_id`; prunes any row whose id no
+longer appears in the imported file):
 
 ```bash
-uv run riftbound-rules-sync
+uv run riftbound-rules-export -o rules.md
+$EDITOR rules.md
+uv run riftbound-rules-import rules.md
 ```
+
+Pass `--no-prune` when importing a *partial* corpus — otherwise the import is
+treated as the complete set and everything absent from it is deleted.
+
+Because the database is the live copy, **back it up**. `riftbound-rules-export`
+is the reviewable, diffable form of that; `pg_dump` covers everything. To update
+the shipped seed after editing, export over it and re-add the `<!-- -->` header
+comment, which documents the authoring convention and doesn't survive the round
+trip (the parser strips comments, so they never reach Postgres).
 
 ## Card data
 
@@ -66,8 +87,12 @@ uv run python -m riftbound_bot.ingest.cards_scrape
 This works by reading a single JSON payload the site's `/gallery` page embeds
 client-side (Next.js RSC data) rather than requesting all 1,256 card pages — much
 lighter on the site, but it also means it depends on that internal data shape and
-**will break if the site changes it**. If it does, fall back to the English
-community data source instead:
+**will break if the site changes it**.
+
+When it does, bootstrap falls back to the snapshot at
+`src/riftbound_bot/ingest/seeds/cards.json` so a fresh environment still comes
+up — stale, but working and free. For genuinely fresher data, the English
+community source is the manual fallback:
 
 ```bash
 uv run python -m riftbound_bot.ingest.cards_from_api
@@ -89,8 +114,13 @@ uv run riftbound-build-index
 
 Re-run this any time the `rules`/`cards` Postgres tables change. It's a full
 rebuild (fixed snapshot, manual refresh, per the design doc — no watch/pipeline).
-Nothing touches `data/turbovec/` until the rebuild finishes successfully: a crash
-mid-build leaves the previous index completely untouched, never a partial one.
+The rebuild writes to a side table and renames it over `embeddings` at the very
+end, so a crash mid-build leaves the previous index completely untouched and
+still being served, never a partial one.
+
+The `vector(N)` column is sized from the first batch of vectors the embedding
+endpoint actually returns — nothing configures the dimension, so a model swap
+just needs a rebuild rather than a setting kept in lockstep.
 
 `build_index.py` also prepends ancestor-heading context to each chunk before
 embedding it — see [retrieval-notes.md](retrieval-notes.md) for why.
@@ -102,6 +132,6 @@ embedding it — see [retrieval-notes.md](retrieval-notes.md) for why.
 - The rules corpus needs the rest of the Core Rules PDF transcribed (see above).
 - Rule 809.1.c.1's worked example says "一張渾沌（Fury）法術" — 渾沌 means Chaos, not
   Fury (Fury is 狂怒, per the rune cards' data). Pre-existing typo.
-- `data/cards/cards.json` is kept as a historical snapshot of the original scrape
-  but is no longer read by any code path — safe to delete once you're comfortable
-  relying on Postgres as the source of truth instead.
+- The card snapshot at `src/riftbound_bot/ingest/seeds/cards.json` is the original
+  scrape, and drifts further from the live site with every set. Re-running
+  `cards_scrape` and re-exporting it keeps the offline fallback useful.

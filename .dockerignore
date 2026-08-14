@@ -6,8 +6,6 @@ __pycache__/
 .git/
 .github/
 tests/
-data/turbovec/
-data/chroma/
 .env
 .env.example
 docs/

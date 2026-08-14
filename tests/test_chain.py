@@ -20,11 +20,10 @@ class FakeResponse:
 
 class FakeVectorstore:
     """Keyed by source_type so tests can control each pool independently,
-    mirroring how the real TurboQuantVectorStore filter={"source_type": ...}
-    search works. `cards`/`rules` back similarity_search's bulk-fetch calls
-    (large k, no scores) that RiftboundRagChain uses to load its exact-match
-    indexes at construction time — mirrors the real store's "return every
-    matching document once k exceeds the candidate count" behavior.
+    mirroring how the real PgVectorStore filter={"source_type": ...} search
+    works. `cards`/`rules` back the fetch_by_source_type calls that
+    RiftboundRagChain uses to load its exact-match indexes at construction
+    time — an unranked read of every document of that type.
     """
 
     def __init__(
@@ -37,15 +36,15 @@ class FakeVectorstore:
         self._cards = cards or []
         self._rules = rules or []
         self.calls: list[tuple[str, int, dict]] = []
-        self.bulk_fetch_calls: list[dict] = []
+        self.bulk_fetch_calls: list[str] = []
 
     def similarity_search_with_relevance_scores(self, query, k, filter):
         self.calls.append((query, k, filter))
         return self._by_type.get(filter["source_type"], [])
 
-    def similarity_search(self, query, k, filter):
-        self.bulk_fetch_calls.append(filter)
-        return self._rules if filter.get("source_type") == "rule" else self._cards
+    def fetch_by_source_type(self, source_type):
+        self.bulk_fetch_calls.append(source_type)
+        return self._rules if source_type == "rule" else self._cards
 
 
 class FakeLLM:
@@ -360,9 +359,9 @@ def test_card_and_rule_indexes_are_loaded_once_at_construction():
     vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[card], rules=[header])
     chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案"), pool_per_type=10, k=6, score_threshold=0.45)
 
-    assert vectorstore.bulk_fetch_calls == [{"source_type": "card"}, {"source_type": "rule"}]
+    assert vectorstore.bulk_fetch_calls == ["card", "rule"]
 
     chain.ask("團結之印是什麼")
     chain.ask("另一個問題")
 
-    assert vectorstore.bulk_fetch_calls == [{"source_type": "card"}, {"source_type": "rule"}]
+    assert vectorstore.bulk_fetch_calls == ["card", "rule"]

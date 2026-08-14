@@ -1,5 +1,5 @@
 """Parses the `[rule.id] title / body` Markdown convention documented at the
-top of data/rules/core_rules_zh_tw.md into one chunk per rule, so every chunk
+top of ingest/seeds/core_rules_zh_tw.md into one chunk per rule, so every chunk
 maps to exactly one citable rule number.
 """
 from __future__ import annotations
