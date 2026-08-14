@@ -1,8 +1,18 @@
+import json
+from types import SimpleNamespace
+
+import pytest
+
 from riftbound_bot.ingest.cards_from_api import (
+    TRANSLATION_ATTEMPTS,
+    ApiCard,
+    TranslationBatchError,
     _clean_name,
     _clean_text,
     _dedupe_printings,
     _normalize_card,
+    _parse_batch_response,
+    _translate_batch,
 )
 
 
@@ -114,3 +124,102 @@ def test_dedupe_collapses_rows_sharing_a_collector_number():
 def test_cards_without_rules_text_normalize_to_empty_string():
     # Vanilla units have no rules text at all; that is not an error.
     assert _normalize_card(_raw_card(text={})).text_en == ""
+
+
+def _api_card(card_id: str, name_en: str = "Bewitching Spirit") -> ApiCard:
+    return ApiCard(
+        id=card_id,
+        name_en=name_en,
+        text_en="When you play me, choose a player. They discard 1.",
+        set=card_id.split("-")[0],
+        collector_number=card_id.split("-")[1],
+        category="單位",
+        color="purple",
+        rarity="普通",
+        energy=3,
+        power=None,
+        might=2,
+    )
+
+
+def _translated(card_id: str, name_zh: str = "魅惑之靈", text_zh: str = "效果") -> dict:
+    return {"id": card_id, "name_zh": name_zh, "text_zh": text_zh}
+
+
+class _ScriptedLLM:
+    """Returns each queued response in turn, recording how often it was asked."""
+
+    def __init__(self, responses: list[str]):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        return SimpleNamespace(content=self.responses.pop(0))
+
+
+def test_batch_response_parses_ids_to_translations():
+    batch = [_api_card("UNL-121"), _api_card("UNL-122")]
+    content = json.dumps([_translated("UNL-121"), _translated("UNL-122", "另一張")])
+
+    assert _parse_batch_response(content, batch) == {
+        "UNL-121": ("魅惑之靈", "效果"),
+        "UNL-122": ("另一張", "效果"),
+    }
+
+
+def test_batch_response_survives_markdown_code_fences():
+    # The prompt forbids them, but models add them anyway.
+    batch = [_api_card("UNL-121")]
+    content = f"```json\n{json.dumps([_translated('UNL-121')])}\n```"
+
+    assert _parse_batch_response(content, batch)["UNL-121"] == ("魅惑之靈", "效果")
+
+
+def test_batch_response_with_wrong_ids_is_rejected():
+    # The damaging case: a response that parses fine but describes other
+    # cards used to leave every card in the batch holding English text.
+    batch = [_api_card("UNL-121")]
+    content = json.dumps([_translated("OGN-001")])
+
+    with pytest.raises(TranslationBatchError, match="ids don't match"):
+        _parse_batch_response(content, batch)
+
+
+def test_batch_response_missing_a_card_is_rejected():
+    batch = [_api_card("UNL-121"), _api_card("UNL-122")]
+    content = json.dumps([_translated("UNL-121")])
+
+    with pytest.raises(TranslationBatchError, match="missing \\['UNL-122'\\]"):
+        _parse_batch_response(content, batch)
+
+
+def test_batch_response_missing_a_key_is_rejected():
+    batch = [_api_card("UNL-121")]
+    content = json.dumps([{"id": "UNL-121", "name_zh": "魅惑之靈"}])
+
+    with pytest.raises(TranslationBatchError, match="text_zh"):
+        _parse_batch_response(content, batch)
+
+
+def test_non_json_batch_response_is_rejected():
+    with pytest.raises(TranslationBatchError, match="not valid JSON"):
+        _parse_batch_response("I'm afraid I can't do that", [_api_card("UNL-121")])
+
+
+def test_translate_batch_retries_an_invalid_response_then_succeeds():
+    batch = [_api_card("UNL-121")]
+    llm = _ScriptedLLM(["not json", json.dumps([_translated("UNL-121")])])
+
+    assert _translate_batch(llm, batch) == {"UNL-121": ("魅惑之靈", "效果")}
+    assert llm.calls == 2
+
+
+def test_translate_batch_raises_once_attempts_are_exhausted():
+    # Failing loudly beats writing English into name_zh and moving on.
+    batch = [_api_card("UNL-121")]
+    llm = _ScriptedLLM(["not json"] * TRANSLATION_ATTEMPTS)
+
+    with pytest.raises(TranslationBatchError):
+        _translate_batch(llm, batch)
+    assert llm.calls == TRANSLATION_ATTEMPTS

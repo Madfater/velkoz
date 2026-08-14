@@ -46,6 +46,16 @@ class Settings:
         )
 
     @classmethod
+    def load_generation(cls) -> GenerationSettings:
+        """Generation config on its own, with no Discord credentials required.
+
+        cards_from_api.py translates card text with the generation model but
+        never touches Discord — loading the full Settings just to reach
+        generation_* would make a bot token mandatory to run a card ingest.
+        """
+        return GenerationSettings(**_generation_settings_kwargs())
+
+    @classmethod
     def load_for_ingest(cls) -> IngestSettings:
         """Ingestion only needs the embedding + storage config, not Discord/generation.
 
@@ -78,6 +88,13 @@ def _embedding_settings_kwargs() -> dict:
         "embedding_api_key": _require("EMBEDDING_API_KEY"),
         "embedding_model": os.environ.get("EMBEDDING_MODEL", "embedding"),
     }
+
+
+@dataclass(frozen=True)
+class GenerationSettings:
+    generation_base_url: str
+    generation_api_key: str
+    generation_model: str
 
 
 @dataclass(frozen=True)

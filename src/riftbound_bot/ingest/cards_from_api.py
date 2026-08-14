@@ -26,10 +26,12 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+import structlog
 from langchain_core.language_models.chat_models import BaseChatModel
 from tenacity import (
     retry,
@@ -41,12 +43,16 @@ from tenacity import (
 from riftbound_bot.ingest.cards_scrape import CardRecord
 from riftbound_bot.rag.llm import build_chat_model
 
+logger = structlog.get_logger("riftbound_bot.cards_from_api")
+
 API_CARDS_URL = "https://api.riftcodex.com/cards"
 CARD_URL_TEMPLATE = "https://riftcodex.com/cards/{card_id}"
 # The API rejects `size` above 100 with a 422, and 403s a request that sends
 # no User-Agent at all.
 PAGE_SIZE = 100
 BATCH_SIZE = 20
+# How many times one batch's translation is re-requested before giving up.
+TRANSLATION_ATTEMPTS = 3
 
 REQUEST_HEADERS = {
     "User-Agent": "riftbound-bot-ingest/0.1 (personal, non-commercial data collection)",
@@ -345,47 +351,119 @@ def fetch_api_cards() -> list[ApiCard]:
     return [_normalize_card(raw) for raw in _dedupe_printings(raw_cards)]
 
 
+class TranslationBatchError(RuntimeError):
+    """A translation response that can't be trusted to describe this batch."""
+
+
+def _strip_code_fences(content: str) -> str:
+    """Models routinely wrap JSON in ```json fences despite being told not to."""
+    text = content.strip()
+    if not text.startswith("```"):
+        return text
+    without_open = re.sub(r"^```[A-Za-z]*\s*", "", text)
+    return re.sub(r"\s*```$", "", without_open).strip()
+
+
+def _parse_batch_response(content: str, batch: list[ApiCard]) -> dict[str, tuple[str, str]]:
+    """Parses one batch's response, rejecting anything that doesn't describe
+    exactly the cards that were sent.
+
+    The ids matter more than they look: translations used to be applied with
+    `translations.get(card.id, (card.name_en, card.text_en))`, so a model that
+    echoed the wrong ids (or returned a short list) silently wrote *English*
+    into name_zh/rules_text_zh for every unmatched card. That produces a
+    Chinese-language index full of English text with nothing in the logs, so
+    an unusable batch is now an error rather than a quiet downgrade.
+    """
+    try:
+        translated = json.loads(_strip_code_fences(content))
+    except json.JSONDecodeError as error:
+        raise TranslationBatchError(f"response was not valid JSON: {error}") from error
+
+    if not isinstance(translated, list):
+        raise TranslationBatchError(f"expected a JSON array, got {type(translated).__name__}")
+
+    parsed: dict[str, tuple[str, str]] = {}
+    for item in translated:
+        if not isinstance(item, dict):
+            raise TranslationBatchError(f"expected objects in the array, got {type(item).__name__}")
+        missing = {"id", "name_zh", "text_zh"} - item.keys()
+        if missing:
+            raise TranslationBatchError(f"item is missing {sorted(missing)}")
+        parsed[str(item["id"])] = (str(item["name_zh"]), str(item["text_zh"]))
+
+    expected = {card.id for card in batch}
+    if parsed.keys() != expected:
+        raise TranslationBatchError(
+            f"ids don't match the batch: missing {sorted(expected - parsed.keys())}, "
+            f"unexpected {sorted(parsed.keys() - expected)}"
+        )
+    return parsed
+
+
 def _translate_batch(llm: BaseChatModel, batch: list[ApiCard]) -> dict[str, tuple[str, str]]:
+    """Translates one batch, retrying a response that fails validation.
+
+    Retries here rather than around the whole run: a malformed response is
+    usually a one-off sampling artifact, and re-asking for the same batch is
+    far cheaper than restarting a ~57-batch translation.
+    """
     payload = [{"id": c.id, "name": c.name_en, "text": c.text_en} for c in batch]
-    response = llm.invoke(
-        [
-            ("system", _TRANSLATION_SYSTEM_PROMPT),
-            ("human", json.dumps(payload, ensure_ascii=False)),
-        ]
+    messages = [
+        ("system", _TRANSLATION_SYSTEM_PROMPT),
+        ("human", json.dumps(payload, ensure_ascii=False)),
+    ]
+    for attempt in range(1, TRANSLATION_ATTEMPTS + 1):
+        response = llm.invoke(messages)
+        try:
+            return _parse_batch_response(str(response.content), batch)
+        except TranslationBatchError as error:
+            if attempt == TRANSLATION_ATTEMPTS:
+                raise
+            logger.warning(
+                "cards_from_api.translation_batch_invalid",
+                attempt=attempt,
+                of=TRANSLATION_ATTEMPTS,
+                error=str(error),
+            )
+    raise AssertionError("unreachable")
+
+
+def _to_record(card: ApiCard, name_zh: str, text_zh: str) -> CardRecord:
+    return CardRecord(
+        id=card.id,
+        set=card.set,
+        collector_number=card.collector_number,
+        name_zh=name_zh,
+        name_en=card.name_en,
+        category=card.category,
+        color=card.color,
+        energy=card.energy,
+        power=card.power,
+        might=card.might,
+        rarity=card.rarity,
+        tags=card.tags,
+        rules_text_zh=text_zh,
+        source_url=CARD_URL_TEMPLATE.format(card_id=card.id),
     )
-    translated = json.loads(str(response.content))
-    return {item["id"]: (item["name_zh"], item["text_zh"]) for item in translated}
 
 
-def translate_all(
+def translate_batches(
     cards: list[ApiCard], base_url: str, api_key: str, model: str
-) -> list[CardRecord]:
+) -> Iterator[list[CardRecord]]:
+    """Yields one translated batch at a time so callers can persist as they go.
+
+    Translating everything before the first write meant a failure in the last
+    batch discarded every generation call made before it; upserts are
+    idempotent, so persisting per batch makes a re-run resume cheaply instead.
+    """
     llm = build_chat_model(base_url=base_url, api_key=api_key, model=model)
-    records: list[CardRecord] = []
-    for start in range(0, len(cards), BATCH_SIZE):
+    total_batches = (len(cards) + BATCH_SIZE - 1) // BATCH_SIZE
+    for index, start in enumerate(range(0, len(cards), BATCH_SIZE), start=1):
         batch = cards[start : start + BATCH_SIZE]
         translations = _translate_batch(llm, batch)
-        for card in batch:
-            name_zh, text_zh = translations.get(card.id, (card.name_en, card.text_en))
-            records.append(
-                CardRecord(
-                    id=card.id,
-                    set=card.set,
-                    collector_number=card.collector_number,
-                    name_zh=name_zh,
-                    name_en=card.name_en,
-                    category=card.category,
-                    color=card.color,
-                    energy=card.energy,
-                    power=card.power,
-                    might=card.might,
-                    rarity=card.rarity,
-                    tags=card.tags,
-                    rules_text_zh=text_zh,
-                    source_url=CARD_URL_TEMPLATE.format(card_id=card.id),
-                )
-            )
-    return records
+        logger.info("cards_from_api.translated_batch", batch=index, of=total_batches, cards=len(batch))
+        yield [_to_record(card, *translations[card.id]) for card in batch]
 
 
 def main() -> None:
@@ -394,22 +472,23 @@ def main() -> None:
     from riftbound_bot.logging_config import configure_logging
 
     configure_logging()
-    # Generation config lives on the bot's full Settings (Discord token
-    # required to load it, even though this script doesn't touch Discord —
-    # a pre-existing quirk, not something this migration changes);
-    # database_url is ingest-only, so it's loaded separately from IngestSettings.
-    bot_settings = Settings.load()
+    generation_settings = Settings.load_generation()
     ingest_settings = Settings.load_for_ingest()
     cards = fetch_api_cards()
-    records = translate_all(
-        cards,
-        base_url=bot_settings.generation_base_url,
-        api_key=bot_settings.generation_api_key,
-        model=bot_settings.generation_model,
-    )
+
+    # Upsert each batch as it lands rather than after the whole translation:
+    # a failure part-way through then keeps everything already paid for.
+    upserted = 0
     with get_connection(ingest_settings) as conn:
-        upsert_cards(conn, [r.__dict__ for r in records])
-    print(f"Upserted {len(records)} translated cards into Postgres.")
+        for records in translate_batches(
+            cards,
+            base_url=generation_settings.generation_base_url,
+            api_key=generation_settings.generation_api_key,
+            model=generation_settings.generation_model,
+        ):
+            upsert_cards(conn, [r.__dict__ for r in records])
+            upserted += len(records)
+    print(f"Upserted {upserted} translated cards into Postgres.")
 
 
 if __name__ == "__main__":
