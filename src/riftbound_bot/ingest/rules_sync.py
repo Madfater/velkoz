@@ -1,7 +1,8 @@
 """CLI: syncs data/rules/*.md into the `rules` Postgres table.
 
 The Markdown files stay the hand-translated, git-tracked authoring source
-(see README) — this script only loads what rules_parser.parse_rules_dir()
+(see docs/data-pipeline.md) — this script only loads what
+rules_parser.parse_rules_dir()
 already parses from them into Postgres, so build_index.py has one consistent
 data source (Postgres) for both rules and cards instead of a file-read for
 one and a JSON-load for the other.

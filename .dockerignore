@@ -10,4 +10,4 @@ data/turbovec/
 data/chroma/
 .env
 .env.example
-riftbound-bot-design.md
+docs/
