@@ -38,7 +38,9 @@ ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
 
 
 def get_connection(settings: IngestSettings) -> psycopg.Connection:
-    conn = psycopg.connect(settings.database_url, autocommit=True)
+    # Explicit connect_timeout: a dead/unreachable database should fail fast
+    # with a clear error, not hang the ingest script indefinitely.
+    conn = psycopg.connect(settings.database_url, autocommit=True, connect_timeout=3)
     ensure_schema(conn)
     return conn
 
