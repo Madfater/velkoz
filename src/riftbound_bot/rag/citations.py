@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from riftbound_bot.rag import metadata as meta
+
 # Longest title still treated as a heading rather than inline rule prose. Rule
 # text authored after the `[id]` marker lands in `title` too (see
 # rules_parser), and a full sentence makes a poor citation label.
@@ -20,22 +22,22 @@ class Citation:
 
 
 def citation_from_metadata(metadata: dict) -> Citation:
-    source_type = metadata.get("source_type")
-    if source_type == "rule":
-        rule_id = metadata.get("rule_id", "")
-        title = metadata.get("title", "")
+    source_type = metadata.get(meta.SOURCE_TYPE)
+    if source_type == meta.RULE:
+        rule_id = metadata.get(meta.RULE_ID, "")
+        title = metadata.get(meta.TITLE, "")
         # Only surface short, heading-like titles in the citation label — long
         # ones mean the rule's full body text was authored inline after the
         # `[id]` marker rather than on a following line, and isn't a heading.
         short_title = title if len(title) <= MAX_HEADING_TITLE_LENGTH else ""
         label = f"規則 {rule_id}" + (f" {short_title}" if short_title else "")
         return Citation(label=label)
-    if source_type == "card":
-        name_zh = metadata.get("name_zh", "")
-        card_id = metadata.get("card_id", "")
+    if source_type == meta.CARD:
+        name_zh = metadata.get(meta.NAME_ZH, "")
+        card_id = metadata.get(meta.CARD_ID, "")
         label = f"卡牌《{name_zh}》（{card_id}）"
-        return Citation(label=label, source_url=metadata.get("source_url") or None)
-    return Citation(label=metadata.get("title") or metadata.get("card_id") or "未知來源")
+        return Citation(label=label, source_url=metadata.get(meta.SOURCE_URL) or None)
+    return Citation(label=metadata.get(meta.TITLE) or metadata.get(meta.CARD_ID) or "未知來源")
 
 
 def format_citations(metadatas: list[dict]) -> str:

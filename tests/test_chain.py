@@ -5,6 +5,7 @@ from riftbound_bot.rag.chain import (
     NO_CONTEXT_REPLY,
     RiftboundRagChain,
 )
+from riftbound_bot.rag.lexical_index import rule_sort_key
 
 
 @dataclass
@@ -428,7 +429,7 @@ def test_rule_subtrees_are_ordered_numerically_not_lexically():
         vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.5
     )
 
-    combined = chain._rule_docs_by_keyword["疾行"].page_content
+    combined = chain.indexes.rule_docs_by_keyword["疾行"].page_content
 
     assert combined.index("第 2 條") < combined.index("第 10 條")
 
@@ -458,3 +459,15 @@ def test_citation_numbers_line_up_with_the_context_block():
     assert "[1] 疾行是一種單位能力。" in context
     assert result.citations_markdown.startswith("[1] 規則 805.1")
     assert "[2] 卡牌《團結之印》" in result.citations_markdown
+
+
+def test_rule_sort_key_orders_mixed_numeric_and_alphabetic_segments():
+    ids = ["135.2.e.10", "135.2.e.2", "135.2.e.2.a", "135.10", "135.2"]
+
+    assert sorted(ids, key=rule_sort_key) == [
+        "135.2",
+        "135.2.e.2",
+        "135.2.e.2.a",
+        "135.2.e.10",
+        "135.10",
+    ]

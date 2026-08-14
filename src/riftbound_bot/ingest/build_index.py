@@ -17,6 +17,7 @@ from riftbound_bot.config import load_ingest_settings
 from riftbound_bot.ingest.db import CARDS_TABLE, RULES_TABLE, get_connection
 from riftbound_bot.ingest.rules_parser import RuleChunk
 from riftbound_bot.logging_config import configure_logging
+from riftbound_bot.rag import metadata as meta
 from riftbound_bot.rag.vectorstore import build_embeddings, create_vectorstore
 
 logger = structlog.get_logger("riftbound_bot.build_index")
@@ -92,10 +93,10 @@ def _rule_documents_from_chunks(chunks: list[RuleChunk]) -> list[Document]:
             Document(
                 page_content=embed_text,
                 metadata={
-                    "source_type": "rule",
-                    "rule_id": chunk.rule_id,
-                    "title": chunk.title,
-                    "source_file": chunk.source_file,
+                    meta.SOURCE_TYPE: meta.RULE,
+                    meta.RULE_ID: chunk.rule_id,
+                    meta.TITLE: chunk.title,
+                    meta.SOURCE_FILE: chunk.source_file,
                 },
             )
         )
@@ -154,12 +155,12 @@ def _card_documents_from_dicts(cards: list[dict]) -> list[Document]:
             Document(
                 page_content=_card_embed_text(card),
                 metadata={
-                    "source_type": "card",
-                    "card_id": card["id"],
-                    "name_zh": card["name_zh"],
-                    "name_en": card.get("name_en", ""),
-                    "rarity": card.get("rarity", ""),
-                    "source_url": card.get("source_url", ""),
+                    meta.SOURCE_TYPE: meta.CARD,
+                    meta.CARD_ID: card["id"],
+                    meta.NAME_ZH: card["name_zh"],
+                    meta.NAME_EN: card.get("name_en", ""),
+                    meta.RARITY: card.get("rarity", ""),
+                    meta.SOURCE_URL: card.get("source_url", ""),
                 },
             )
         )

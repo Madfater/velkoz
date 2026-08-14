@@ -9,26 +9,14 @@ from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.vectorstores import VectorStore
 
+from riftbound_bot.rag import metadata as meta
 from riftbound_bot.rag.citations import format_citations
+from riftbound_bot.rag.lexical_index import LexicalIndexes
 
 logger = structlog.get_logger("riftbound_bot.chain")
 
-# A top-level (dot-free) rule chunk whose entire title is "CJK term（English
-# gloss）" with no body of its own — the same shape as 805 疾行（Accelerate）,
-# 809 偏斜（Deflect）, 811 待命（Hidden）. Used to detect rule sections that,
-# like card names, have a short proper-noun-like term a user is likely to
-# type verbatim.
-_KEYWORD_TITLE_RE = re.compile(r"^(.+)（([A-Za-z][A-Za-z\s\-]*)）$")
-
 # A bracket shorthand token as used throughout rules text, e.g. "[A]", "[C]".
 _SYMBOL_RE = re.compile(r"\[([A-Za-z])\]")
-
-# The corpus's own consistent phrasing for introducing a symbol's shorthand
-# (134.2.a-f for domain symbols, 135.2.e.2/.3/.5/.6 for the rest) — used to
-# find which rule defines a given "[X]" structurally, not via a hardcoded
-# symbol table. Deliberately doesn't match "簡稱標示為 [T]"-style deprecated
-# aliases (135.2.e.2/.3's parenthetical asides use a different phrase).
-_SYMBOL_DEFINITION_RE = re.compile(r"簡稱為\s*\[([A-Za-z])\]")
 
 # Sentinel score for force-included exact-name matches — deliberately not a
 # real cosine value, so it can never accidentally tie/compare against a
@@ -48,14 +36,6 @@ MAX_EXACT_MATCH_NAMES = 4
 # close multi-hop questions. k is therefore a target, not a hard cap: the
 # worst case is 3 categories x MAX_EXACT_MATCH_NAMES plus this floor.
 MIN_POOL_SLOTS = 2
-
-# Upper bound for the "give me everything matching this filter" bulk-fetch
-# used at chain-construction time (see _load_card_docs_by_name /
-# _load_rule_chunks). TurboQuantVectorStore's similarity_search returns the
-# complete filtered set once k >= the candidate count — this just needs
-# comfortable headroom over the corpus (~1,300 documents today), not an
-# exact count.
-_BULK_FETCH_LIMIT = 20_000
 
 SYSTEM_PROMPT = """\
 你是一個 Riftbound（符文之地）集換式卡牌遊戲的規則裁判助手，服務對象是繁體中文玩家。
@@ -118,7 +98,13 @@ class RiftboundRagChain:
     topic-context prepending to the full ancestor-heading chain.
     _symbol_expansions handles this last mile: a one-hop expansion over the
     small, closed set of bracket symbols this corpus defines (see
-    _SYMBOL_DEFINITION_RE), not a general multi-hop retrieval mechanism.
+    lexical_index.SYMBOL_DEFINITION_RE), not a general multi-hop retrieval
+    mechanism.
+
+    The three lexical lookups themselves are built in rag/lexical_index.py.
+    README's "Known issue: card retrieval quality" section records the
+    measurements behind all of this, including what remains unsolved for
+    fuzzy and attribute-only queries.
     """
 
     def __init__(
@@ -134,106 +120,7 @@ class RiftboundRagChain:
         self.pool_per_type = pool_per_type
         self.k = k
         self.score_threshold = score_threshold
-        self._card_docs_by_name = self._load_card_docs_by_name()
-        rule_docs = self._load_rule_chunks()
-        self._rule_docs_by_keyword = self._index_rule_subtrees(rule_docs, _KEYWORD_TITLE_RE, lambda m: m.group(1))
-        self._rule_docs_by_symbol = self._index_rule_subtrees(
-            rule_docs, _SYMBOL_DEFINITION_RE, lambda m: m.group(1), search=True
-        )
-
-    def _load_card_docs_by_name(self) -> dict[str, list[Document]]:
-        """Loaded once from the vectorstore itself (not cards.json/Postgres) so
-        this can never drift from what's actually indexed and searchable.
-
-        Uses similarity_search with a throwaway query and a generous k rather
-        than Chroma's collection-level .get(where=...) — TurboVec's
-        TurboQuantVectorStore has no bulk filtered-fetch API, but
-        similarity_search returns the *complete* filtered set once k meets
-        or exceeds the candidate count (confirmed against the installed
-        package: the store builds an allow-list from every matching document
-        first, then returns min(k, n_allowed) results), so a large
-        _BULK_FETCH_LIMIT gets everything, unranked-order doesn't matter
-        here. Costs one throwaway embedding call, at chain-construction
-        (bot startup) time only — not per-request.
-        """
-        docs = self.vectorstore.similarity_search(
-            "", k=_BULK_FETCH_LIMIT, filter={"source_type": "card"}
-        )
-        by_name: dict[str, list[Document]] = {}
-        for doc in docs:
-            name = doc.metadata.get("name_zh")
-            if not name:
-                continue
-            by_name.setdefault(name, []).append(doc)
-        return by_name
-
-    def _load_rule_chunks(self) -> list[Document]:
-        return self.vectorstore.similarity_search(
-            "", k=_BULK_FETCH_LIMIT, filter={"source_type": "rule"}
-        )
-
-    @staticmethod
-    def _rule_sort_key(rule_id: str) -> tuple:
-        """Orders dotted rule ids the way the rulebook does.
-
-        Segment-wise string comparison put 805.10 before 805.2. Segments are
-        mixed (135.2.e.5.a), so numeric ones sort as numbers and ahead of
-        alphabetic ones at the same depth.
-        """
-        return tuple(
-            (0, int(segment), "") if segment.isdigit() else (1, 0, segment)
-            for segment in rule_id.split(".")
-        )
-
-    @staticmethod
-    def _combine_subtree(root_id: str, title: str, chunks: list[Document]) -> Document:
-        """Combines a rule id and everything nested under it (rule_id ==
-        root_id or starting with "root_id.") into one Document, sorted so
-        sub-rules stay in their natural reading order. Individual sub-rules
-        are often too short/generic to embed well on their own (see
-        build_index.py's topic-context-prepending comment for the same
-        problem one level up) — one combined document per matched section
-        mirrors one document per card name in _load_card_docs_by_name.
-        """
-        subtree = sorted(
-            (
-                (doc.metadata.get("rule_id", ""), doc.page_content)
-                for doc in chunks
-                if doc.metadata.get("rule_id") == root_id
-                or doc.metadata.get("rule_id", "").startswith(f"{root_id}.")
-            ),
-            key=lambda item: RiftboundRagChain._rule_sort_key(item[0]),
-        )
-        return Document(
-            page_content="\n".join(content for _id, content in subtree),
-            metadata={"source_type": "rule", "rule_id": root_id, "title": title},
-        )
-
-    def _index_rule_subtrees(
-        self, chunks: list[Document], pattern: re.Pattern, extract_key, search: bool = False
-    ) -> dict[str, Document]:
-        """Shared engine behind _rule_docs_by_keyword and _rule_docs_by_symbol:
-        find every chunk whose own text matches `pattern` (a keyword's
-        top-level title, or a symbol-definition phrase), and combine that
-        chunk's rule and its full subtree into one Document keyed by
-        whatever `extract_key` pulls out of the match (the keyword term, or
-        the symbol letter). `search=True` scans anywhere in a chunk's text
-        (symbol definitions are usually mid-sentence); otherwise the whole
-        title must match (keyword headers are exactly "term（gloss）", no
-        more, no less — a `search` here would false-positive on inline
-        parentheticals like rule 103.1's "一張冠軍傳奇（Champion Legend）").
-        """
-        by_key: dict[str, Document] = {}
-        for doc in chunks:
-            title = doc.metadata.get("title", "")
-            match = (pattern.search if search else pattern.match)(doc.page_content if search else title)
-            if not match:
-                continue
-            root_id = doc.metadata.get("rule_id", "")
-            if not search and "." in root_id:
-                continue
-            by_key[extract_key(match)] = self._combine_subtree(root_id, title, chunks)
-        return by_key
+        self.indexes = LexicalIndexes(vectorstore)
 
     @staticmethod
     def _pick_printing(printings: list[Document]) -> Document:
@@ -242,9 +129,9 @@ class RiftboundRagChain:
         lowest card_id so the pick is deterministic rather than dependent on
         vectorstore return order.
         """
-        non_alt = [doc for doc in printings if doc.metadata.get("rarity") != "異畫"]
+        non_alt = [doc for doc in printings if doc.metadata.get(meta.RARITY) != meta.ALT_ART_RARITY]
         pool = non_alt or printings
-        return min(pool, key=lambda doc: doc.metadata.get("card_id", ""))
+        return min(pool, key=lambda doc: doc.metadata.get(meta.CARD_ID, ""))
 
     @staticmethod
     def _specific_substring_matches(candidates, question: str) -> list[str]:
@@ -270,9 +157,9 @@ class RiftboundRagChain:
         lexical fact that a similarity score shouldn't be trusted to surface
         reliably on its own.
         """
-        matches = self._specific_substring_matches(self._card_docs_by_name, question)
+        matches = self._specific_substring_matches(self.indexes.card_docs_by_name, question)
         return [
-            (self._pick_printing(self._card_docs_by_name[name]), EXACT_MATCH_SCORE)
+            (self._pick_printing(self.indexes.card_docs_by_name[name]), EXACT_MATCH_SCORE)
             for name in matches[:MAX_EXACT_MATCH_NAMES]
         ]
 
@@ -284,8 +171,8 @@ class RiftboundRagChain:
         prepending, when the question is a multi-hop interaction question
         rather than a direct "what is X" definition question.
         """
-        matches = self._specific_substring_matches(self._rule_docs_by_keyword, question)
-        return [(self._rule_docs_by_keyword[name], EXACT_MATCH_SCORE) for name in matches[:MAX_EXACT_MATCH_NAMES]]
+        matches = self._specific_substring_matches(self.indexes.rule_docs_by_keyword, question)
+        return [(self.indexes.rule_docs_by_keyword[name], EXACT_MATCH_SCORE) for name in matches[:MAX_EXACT_MATCH_NAMES]]
 
     def _symbol_expansions(self, docs: list[Document]) -> list[tuple[Document, float]]:
         """When a force-included document's own text uses a bracket shorthand
@@ -299,22 +186,22 @@ class RiftboundRagChain:
         over a small, closed, well-defined symbol vocabulary — not a general
         multi-hop retrieval mechanism.
         """
-        included_ids = {doc.metadata.get("rule_id") for doc in docs}
+        included_ids = {doc.metadata.get(meta.RULE_ID) for doc in docs}
         symbols: set[str] = set()
         for doc in docs:
             symbols.update(_SYMBOL_RE.findall(doc.page_content))
 
         expansions = []
         for symbol in sorted(symbols):
-            definition = self._rule_docs_by_symbol.get(symbol)
-            if definition and definition.metadata.get("rule_id") not in included_ids:
+            definition = self.indexes.rule_docs_by_symbol.get(symbol)
+            if definition and definition.metadata.get(meta.RULE_ID) not in included_ids:
                 expansions.append((definition, EXACT_MATCH_SCORE))
-                included_ids.add(definition.metadata.get("rule_id"))
+                included_ids.add(definition.metadata.get(meta.RULE_ID))
         return expansions[:MAX_EXACT_MATCH_NAMES]
 
     def _search_pool(self, question: str, source_type: str) -> list[tuple[Document, float]]:
         results = self.vectorstore.similarity_search_with_relevance_scores(
-            question, k=self.pool_per_type, filter={"source_type": source_type}
+            question, k=self.pool_per_type, filter={meta.SOURCE_TYPE: source_type}
         )
         scored = [(doc, score) for doc, score in results if score >= self.score_threshold]
         logger.debug(
@@ -338,15 +225,15 @@ class RiftboundRagChain:
         exact_keywords = self._exact_keyword_matches(question)
         symbol_expansions = self._symbol_expansions([doc for doc, _ in exact_cards + exact_keywords])
 
-        exact_card_ids = {doc.metadata.get("card_id") for doc, _ in exact_cards}
-        exact_rule_ids = {doc.metadata.get("rule_id") for doc, _ in exact_keywords + symbol_expansions}
+        exact_card_ids = {doc.metadata.get(meta.CARD_ID) for doc, _ in exact_cards}
+        exact_rule_ids = {doc.metadata.get(meta.RULE_ID) for doc, _ in exact_keywords + symbol_expansions}
 
-        pool = self._search_pool(question, "rule") + self._search_pool(question, "card")
+        pool = self._search_pool(question, meta.RULE) + self._search_pool(question, meta.CARD)
         pool = [
             item
             for item in pool
-            if item[0].metadata.get("card_id") not in exact_card_ids
-            and not self._in_matched_rule_subtree(item[0].metadata.get("rule_id"), exact_rule_ids)
+            if item[0].metadata.get(meta.CARD_ID) not in exact_card_ids
+            and not self._in_matched_rule_subtree(item[0].metadata.get(meta.RULE_ID), exact_rule_ids)
         ]
         pool.sort(key=lambda item: item[1], reverse=True)
 
