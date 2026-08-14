@@ -81,27 +81,67 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Triggers a redeploy on the target server. This project uses Arcane
-      # (a self-hosted Docker-management UI, https://getarcane.app) — its
-      # inbound webhook is `POST /api/webhooks/trigger/{token}`, where the
-      # token embedded in the URL *is* the credential (no extra header
-      # needed), created via Arcane's Settings -> Webhooks UI. Bind it to
-      # the bot project's "Update" action, not "Redeploy" — a known upstream
-      # bug (getarcaneapp/arcane#1943) affects Redeploy's down+up sequence
-      # on agent-managed hosts; verify against your own Arcane instance
-      # before relying on Redeploy instead.
+      # Deploys to Arcane (a self-hosted Docker-management UI,
+      # https://getarcane.app) via its REST API, authenticated with an API
+      # key in the `X-Api-Key` header.
+      #
+      # This is TWO ordered calls, and both are load-bearing:
+      #
+      #   1. gitops-syncs/<id>/sync — copies docker-compose.yml from this repo
+      #      into the Arcane project. The sync is configured autoSync=false,
+      #      so without this call Arcane keeps deploying whatever compose it
+      #      last saw, no matter how many times you redeploy.
+      #   2. projects/<id>/up — pulls :latest (compose-side `pull_policy:
+      #      always`) and recreates whatever changed.
+      #
+      # Skipping step 1 is what broke the deploy on 2026-08-14: the project
+      # stayed pinned to the pre-#10 compose (postgres:16-alpine, ./data bind
+      # mount) while :latest moved on to the postgres-only image. bootstrap
+      # then died on `CREATE EXTENSION vector` (exit 1) against stock
+      # postgres, and because bot gates on `service_completed_successfully`
+      # it never started at all. The old ARCANE_WEBHOOK_URL webhook only ever
+      # did step 2, so re-pointing it would not have been enough.
       #
       # Operational notes:
-      # - Getting the freshly-pushed :latest instead of a cached layer is
-      #   enforced compose-side by `pull_policy: always` (docker-compose.yml);
-      #   setting Arcane's own project pull policy to "always" too is belt and
-      #   braces. Without either, Update re-runs the stale local image and the
-      #   deploy silently no-ops.
+      # - Both endpoints stream newline-delimited JSON. A non-2xx is caught by
+      #   `--fail-with-body`; an error reported *inside* a 200 stream is caught
+      #   by grepping for `"success":false`. Without the grep a failed deploy
+      #   looks green.
       # - The GHCR package must be public, or the Arcane host needs
       #   `docker login ghcr.io` with a PAT that has read:packages.
-      # - Arcane's webhook has no "redeploy this specific version" concept —
-      #   it always resolves whatever :latest points to. The sha-<...> tags
-      #   above are audit/rollback artifacts only. Rollback = re-tag a known
-      #   good sha-<...> as :latest in GHCR, then re-trigger this webhook.
-      - name: Trigger Arcane redeploy
-        run: curl -fsS -X POST "${{ secrets.ARCANE_WEBHOOK_URL }}"
+      # - There is no "deploy this specific version" concept — `up` always
+      #   resolves whatever :latest points to. The sha-<...> tags above are
+      #   audit/rollback artifacts only. Rollback = re-tag a known good
+      #   sha-<...> as :latest in GHCR, then re-run this job.
+      - name: Deploy to Arcane
+        env:
+          ARCANE_URL: ${{ secrets.ARCANE_URL }}
+          ARCANE_API_KEY: ${{ secrets.ARCANE_API_KEY }}
+          ENV_ID: "0"
+          SYNC_ID: d5adc72f-efe9-45b5-9549-11922ab47a24
+          PROJECT_ID: ef841605-4714-4f4d-82e8-226f9cede703
+        run: |
+          set -euo pipefail
+
+          arcane() {
+            curl -sS --fail-with-body -X POST \
+              -H "X-Api-Key: ${ARCANE_API_KEY}" \
+              -H 'Content-Type: application/json' \
+              -d '{}' "${ARCANE_URL}$1"
+          }
+
+          echo "::group::Sync compose from git"
+          arcane "/api/environments/${ENV_ID}/gitops-syncs/${SYNC_ID}/sync" | tee sync.log
+          echo "::endgroup::"
+          if grep -q '"success":false' sync.log; then
+            echo "::error::GitOps sync failed"; exit 1
+          fi
+
+          echo "::group::Bring the project up"
+          arcane "/api/environments/${ENV_ID}/projects/${PROJECT_ID}/up" | tee up.log
+          echo "::endgroup::"
+          if grep -q '"success":false' up.log; then
+            echo "::error::Project up failed"; exit 1
+          fi
+
+          echo "Deployed."

@@ -65,10 +65,21 @@ fails with `No module named python`.
 
 ## CI/CD
 
-CI builds and pushes the image to GHCR on every push to `main`, then triggers a
-redeploy via a webhook — see
-[`.github/workflows/ci-cd.yml`](../.github/workflows/ci-cd.yml).
+CI builds and pushes the image to GHCR on every push to `main`, then deploys it
+to Arcane — see [`.github/workflows/ci-cd.yml`](../.github/workflows/ci-cd.yml).
 
-Configure `ARCANE_WEBHOOK_URL` (or whatever your deploy webhook is) as a GitHub
-Actions secret. That workflow file's comments cover the operational details: pull
-policy, package visibility, and rollback.
+Configure two GitHub Actions secrets: `ARCANE_URL` (the instance base URL) and
+`ARCANE_API_KEY` (Settings -> API Keys in Arcane; sent as `X-Api-Key`).
+
+Deploying is **two** API calls, in order — sync the compose from git, then bring
+the project up. Both matter. The Arcane project is GitOps-managed but configured
+`autoSync: false`, so nothing pulls a new `docker-compose.yml` on its own: skip
+the sync call and Arcane will happily redeploy the compose it last saw while the
+image moves on underneath it. That mismatch is not a hypothetical — it is how the
+deploy broke on 2026-08-14, and the symptom was a bot that never started at all
+(`bootstrap` exited 1 on `CREATE EXTENSION vector` against a stale
+`postgres:16-alpine`). The older webhook-based trigger only ever did the second
+call, which is why it could not have caught this.
+
+The workflow file's comments cover the rest: pull policy, package visibility, and
+rollback.
