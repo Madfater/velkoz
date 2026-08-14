@@ -100,12 +100,19 @@ def _connect_vectorstore(settings: Settings) -> PgVectorStore:
     healthy while being uniformly wrong.
     """
     pool = ConnectionPool(settings.database_url, min_size=1, max_size=4, timeout=10)
-    with pool.connection() as conn:
-        if not index_populated(conn):
-            raise RuntimeError(
-                "No vector index in Postgres — run `python -m "
-                "riftbound_bot.ingest.bootstrap` first."
-            )
+    try:
+        with pool.connection() as conn:
+            if not index_populated(conn):
+                raise RuntimeError(
+                    "No vector index in Postgres — run `python -m "
+                    "riftbound_bot.ingest.bootstrap` first."
+                )
+    except BaseException:
+        # The pool starts worker threads on construction, so bailing out
+        # without closing it leaks them and buries the actual startup error
+        # under a "cannot join current thread" traceback from __del__.
+        pool.close()
+        raise
     embeddings = build_embeddings(
         base_url=settings.embedding_base_url,
         api_key=settings.embedding_api_key,
