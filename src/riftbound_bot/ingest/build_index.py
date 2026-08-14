@@ -23,6 +23,16 @@ logger = structlog.get_logger("riftbound_bot.build_index")
 
 
 def _rule_documents(conn) -> list[Document]:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT data FROM {RULES_TABLE}")
+        rows = [row[0] for row in cur.fetchall()]
+    if not rows:
+        logger.warning("build_index.no_rules", hint="run rules_sync.py first")
+        return []
+    return _rule_documents_from_chunks([RuleChunk(**row) for row in rows])
+
+
+def _rule_documents_from_chunks(chunks: list[RuleChunk]) -> list[Document]:
     """Builds one Document per rule chunk, with its ancestor *headings*
     prepended to the embedded content (outermost first).
 
@@ -56,11 +66,6 @@ def _rule_documents(conn) -> list[Document]:
     embeds identically to before (811 itself is the only heading-shaped
     ancestor any of its sub-rules have).
     """
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT data FROM {RULES_TABLE}")
-        chunks = [RuleChunk(**row[0]) for row in cur.fetchall()]
-    if not chunks:
-        print("No rule data in Postgres — skipping rules (run rules_sync.py first).")
     by_id = {chunk.rule_id: chunk for chunk in chunks}
     sentence_end = ("。", "！", "？")
 
@@ -97,28 +102,62 @@ def _rule_documents(conn) -> list[Document]:
     return documents
 
 
+def _card_embed_text(card: dict) -> str:
+    """The text a card is retrieved by.
+
+    Includes colour, rarity, stats and trait tags rather than just
+    name/id/category/effect: those attributes are the whole substance of
+    questions like "哪些卡可以獲得黃色力量" or "紅色 3 費單位", and leaving
+    them out of the embedded string made such questions unanswerable no
+    matter how the similarity search was tuned.
+    """
+    stat_bits = []
+    for label, key in (("費用", "energy"), ("力量", "power"), ("戰力", "might")):
+        value = card.get(key)
+        if value is not None:
+            stat_bits.append(f"{label} {value}")
+    stats = "、".join(stat_bits)
+    tags = card.get("tags") or []
+    tag_str = f"｜標籤：{'、'.join(tags)}" if tags else ""
+
+    header = (
+        f"{card.get('name_zh', '')}（{card.get('name_en', '')}）"
+        f"｜{card.get('id', '')}｜{card.get('category', '')}"
+        f"｜顏色：{card.get('color', '')}｜稀有度：{card.get('rarity', '')}"
+        f"{'｜' + stats if stats else ''}{tag_str}"
+    )
+    if card.get("rules_text_zh"):
+        return f"{header}\n效果：{card['rules_text_zh']}"
+    return header
+
+
 def _card_documents(conn) -> list[Document]:
     with conn.cursor() as cur:
         cur.execute(f"SELECT data FROM {CARDS_TABLE}")
         cards = [row[0] for row in cur.fetchall()]
     if not cards:
-        print("No card data in Postgres — skipping cards (run cards_scrape.py first).")
+        logger.warning("build_index.no_cards", hint="run cards_scrape.py first")
         return []
+    return _card_documents_from_dicts(cards)
+
+
+def _card_documents_from_dicts(cards: list[dict]) -> list[Document]:
     documents = []
     for card in cards:
-        text_parts = [
-            f"{card['name_zh']}（{card['name_en']}）｜{card['id']}｜{card['category']}",
-        ]
-        if card.get("rules_text_zh"):
-            text_parts.append(f"效果：{card['rules_text_zh']}")
+        # A row missing its id or name can't be cited or looked up by name, so
+        # it's worth skipping loudly rather than aborting a whole rebuild on
+        # one malformed record.
+        if not card.get("id") or not card.get("name_zh"):
+            logger.warning("build_index.card_skipped", card_id=card.get("id"))
+            continue
         documents.append(
             Document(
-                page_content="\n".join(text_parts),
+                page_content=_card_embed_text(card),
                 metadata={
                     "source_type": "card",
                     "card_id": card["id"],
                     "name_zh": card["name_zh"],
-                    "name_en": card["name_en"],
+                    "name_en": card.get("name_en", ""),
                     "rarity": card.get("rarity", ""),
                     "source_url": card.get("source_url", ""),
                 },
@@ -163,7 +202,7 @@ def main() -> None:
     configure_logging()
     settings = Settings.load_for_ingest()
     count = build_index(settings)
-    print(f"Done. Indexed {count} chunks into {settings.vector_store_dir}.")
+    logger.info("build_index.done", indexed=count, persist_dir=settings.vector_store_dir)
 
 
 if __name__ == "__main__":

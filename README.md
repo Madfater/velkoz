@@ -140,6 +140,11 @@ index completely untouched, never a partial one:
 uv run riftbound-build-index
 ```
 
+Each card is embedded with its colour, rarity, energy/power/might and trait tags alongside its
+name and effect text, so attribute questions ("紅色 3 費單位") have something to match on. An
+index built before that change carries the older, sparser card text — rebuild once to pick it
+up.
+
 ## Running the bot
 
 ```bash

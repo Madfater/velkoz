@@ -53,24 +53,6 @@ class CardRecord:
     rules_text_zh: str
     source_url: str
 
-    @property
-    def text(self) -> str:
-        """Text to embed for retrieval."""
-        stat_bits = []
-        if self.energy is not None:
-            stat_bits.append(f"費用 {self.energy}")
-        if self.power is not None:
-            stat_bits.append(f"力量 {self.power}")
-        if self.might is not None:
-            stat_bits.append(f"戰力 {self.might}")
-        stats = "、".join(stat_bits)
-        tag_str = f"｜標籤：{'、'.join(self.tags)}" if self.tags else ""
-        return (
-            f"{self.name_zh}（{self.name_en}）｜{self.id}｜{self.category}｜"
-            f"顏色：{self.color}｜稀有度：{self.rarity}｜{stats}{tag_str}\n"
-            f"效果：{self.rules_text_zh}"
-        )
-
 
 def _clean_effect_text(raw: str) -> str:
     """Strips the site's `{{keyword}}` highlight markup down to plain text."""
