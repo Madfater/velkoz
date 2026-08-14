@@ -16,6 +16,12 @@ from dataclasses import dataclass
 
 import httpx
 from langchain_core.language_models.chat_models import BaseChatModel
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from riftbound_bot.ingest.cards_scrape import CardRecord
 from riftbound_bot.rag.llm import build_chat_model
@@ -62,6 +68,12 @@ def _strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+@retry(
+    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=1, max=20),
+    reraise=True,
+)
 def fetch_gist_cards() -> list[GistCard]:
     resp = httpx.get(GIST_RAW_URL, timeout=30, follow_redirects=True)
     resp.raise_for_status()
@@ -133,22 +145,27 @@ def translate_all(
 
 
 def main() -> None:
-    import sys
-
     from riftbound_bot.config import Settings
+    from riftbound_bot.ingest.db import get_connection, upsert_cards
+    from riftbound_bot.logging_config import configure_logging
 
-    settings = Settings.load()
+    configure_logging()
+    # Generation config lives on the bot's full Settings (Discord token
+    # required to load it, even though this script doesn't touch Discord —
+    # a pre-existing quirk, not something this migration changes);
+    # database_url is ingest-only, so it's loaded separately from IngestSettings.
+    bot_settings = Settings.load()
+    ingest_settings = Settings.load_for_ingest()
     cards = fetch_gist_cards()
     records = translate_all(
         cards,
-        base_url=settings.generation_base_url,
-        api_key=settings.generation_api_key,
-        model=settings.generation_model,
+        base_url=bot_settings.generation_base_url,
+        api_key=bot_settings.generation_api_key,
+        model=bot_settings.generation_model,
     )
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "data/cards/cards.json"
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump([r.__dict__ for r in records], fh, ensure_ascii=False, indent=2)
-    print(f"Wrote {len(records)} translated cards to {out_path}")
+    with get_connection(ingest_settings) as conn:
+        upsert_cards(conn, [r.__dict__ for r in records])
+    print(f"Upserted {len(records)} translated cards into Postgres.")
 
 
 if __name__ == "__main__":

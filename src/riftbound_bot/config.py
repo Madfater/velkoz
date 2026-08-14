@@ -28,12 +28,10 @@ class Settings:
     retrieval_pool_per_type: int
     retrieval_k: int
     retrieval_score_threshold: float
-    chroma_persist_dir: str
-    rules_dir: str
-    cards_file: str
+    vector_store_dir: str
 
     @classmethod
-    def load(cls) -> "Settings":
+    def load(cls) -> Settings:
         return cls(
             discord_bot_token=_require("DISCORD_BOT_TOKEN"),
             discord_guild_id=int(_require("DISCORD_GUILD_ID")),
@@ -44,19 +42,22 @@ class Settings:
             retrieval_score_threshold=float(
                 os.environ.get("RETRIEVAL_SCORE_THRESHOLD", "0.45")
             ),
-            chroma_persist_dir=os.environ.get("CHROMA_PERSIST_DIR", "data/chroma"),
-            rules_dir=os.environ.get("RULES_DIR", "data/rules"),
-            cards_file=os.environ.get("CARDS_FILE", "data/cards/cards.json"),
+            vector_store_dir=os.environ.get("VECTOR_STORE_DIR", "data/turbovec"),
         )
 
     @classmethod
-    def load_for_ingest(cls) -> "IngestSettings":
-        """Ingestion only needs the embedding + storage config, not Discord/generation."""
+    def load_for_ingest(cls) -> IngestSettings:
+        """Ingestion only needs the embedding + storage config, not Discord/generation.
+
+        `database_url`/`rules_dir` are ingest-time only — the live bot never
+        touches Postgres or the rules Markdown source, only the built vector
+        store (see rag/vectorstore.py's load_vectorstore).
+        """
         return IngestSettings(
             **_embedding_settings_kwargs(),
-            chroma_persist_dir=os.environ.get("CHROMA_PERSIST_DIR", "data/chroma"),
+            vector_store_dir=os.environ.get("VECTOR_STORE_DIR", "data/turbovec"),
             rules_dir=os.environ.get("RULES_DIR", "data/rules"),
-            cards_file=os.environ.get("CARDS_FILE", "data/cards/cards.json"),
+            database_url=_require("DATABASE_URL"),
         )
 
 
@@ -84,6 +85,6 @@ class IngestSettings:
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
-    chroma_persist_dir: str
+    vector_store_dir: str
     rules_dir: str
-    cards_file: str
+    database_url: str

@@ -1,24 +1,28 @@
-"""CLI: (re)builds the local Chroma vector store from data/rules/ and
-data/cards/cards.json. Manual, re-runnable refresh — no ingestion pipeline
-or watch process, matching the design doc's "fixed snapshot" data model.
+"""CLI: (re)builds the TurboVec vector store from the `rules` and `cards`
+Postgres tables (populated by rules_sync.py / cards_scrape.py /
+cards_from_gist.py). Manual, re-runnable refresh — no ingestion pipeline or
+watch process, matching the design doc's "fixed snapshot" data model.
 
 Usage:
     python -m riftbound_bot.ingest.build_index
 """
 from __future__ import annotations
 
-import json
-import shutil
 from pathlib import Path
 
+import structlog
 from langchain_core.documents import Document
 
 from riftbound_bot.config import Settings
-from riftbound_bot.ingest.rules_parser import parse_rules_dir
-from riftbound_bot.rag.vectorstore import get_vectorstore
+from riftbound_bot.ingest.db import CARDS_TABLE, RULES_TABLE, get_connection
+from riftbound_bot.ingest.rules_parser import RuleChunk
+from riftbound_bot.logging_config import configure_logging
+from riftbound_bot.rag.vectorstore import build_embeddings, create_vectorstore
+
+logger = structlog.get_logger("riftbound_bot.build_index")
 
 
-def _rule_documents(rules_dir: str) -> list[Document]:
+def _rule_documents(conn) -> list[Document]:
     """Builds one Document per rule chunk, with its ancestor *headings*
     prepended to the embedded content (outermost first).
 
@@ -52,7 +56,11 @@ def _rule_documents(rules_dir: str) -> list[Document]:
     embeds identically to before (811 itself is the only heading-shaped
     ancestor any of its sub-rules have).
     """
-    chunks = parse_rules_dir(rules_dir)
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT data FROM {RULES_TABLE}")
+        chunks = [RuleChunk(**row[0]) for row in cur.fetchall()]
+    if not chunks:
+        print("No rule data in Postgres — skipping rules (run rules_sync.py first).")
     by_id = {chunk.rule_id: chunk for chunk in chunks}
     sentence_end = ("。", "！", "？")
 
@@ -89,12 +97,13 @@ def _rule_documents(rules_dir: str) -> list[Document]:
     return documents
 
 
-def _card_documents(cards_file: str) -> list[Document]:
-    path = Path(cards_file)
-    if not path.exists():
-        print(f"No card data at {cards_file} — skipping cards (run cards_scrape.py first).")
+def _card_documents(conn) -> list[Document]:
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT data FROM {CARDS_TABLE}")
+        cards = [row[0] for row in cur.fetchall()]
+    if not cards:
+        print("No card data in Postgres — skipping cards (run cards_scrape.py first).")
         return []
-    cards = json.loads(path.read_text(encoding="utf-8"))
     documents = []
     for card in cards:
         text_parts = [
@@ -119,35 +128,42 @@ def _card_documents(cards_file: str) -> list[Document]:
 
 
 def build_index(settings) -> int:
-    persist_dir = Path(settings.chroma_persist_dir)
-    if persist_dir.exists():
-        shutil.rmtree(persist_dir)
-    persist_dir.mkdir(parents=True, exist_ok=True)
-
-    documents = _rule_documents(settings.rules_dir) + _card_documents(settings.cards_file)
+    with get_connection(settings) as conn:
+        documents = _rule_documents(conn) + _card_documents(conn)
     if not documents:
-        raise RuntimeError("No documents found to index — check RULES_DIR / CARDS_FILE.")
+        raise RuntimeError(
+            "No documents found to index — run rules_sync.py / cards_scrape.py first."
+        )
 
-    vectorstore = get_vectorstore(
-        persist_dir=str(persist_dir),
-        embedding_base_url=settings.embedding_base_url,
-        embedding_api_key=settings.embedding_api_key,
-        embedding_model=settings.embedding_model,
+    embeddings = build_embeddings(
+        base_url=settings.embedding_base_url,
+        api_key=settings.embedding_api_key,
+        model=settings.embedding_model,
     )
-    # Embed in batches so progress is visible on a full rebuild.
+    vectorstore = create_vectorstore(embeddings)
+    # Embed in batches so progress is visible on a full rebuild. Nothing
+    # touches disk until the final dump() below — a crash mid-loop leaves
+    # whatever was already persisted at persist_dir completely untouched,
+    # unlike Chroma's old auto-persist-per-write behavior which could leave
+    # the bot silently serving a partial index after a crash.
     batch_size = 100
     for start in range(0, len(documents), batch_size):
         batch = documents[start : start + batch_size]
         vectorstore.add_documents(batch)
-        print(f"Indexed {min(start + batch_size, len(documents))}/{len(documents)}")
+        logger.info("build_index.progress", indexed=min(start + batch_size, len(documents)), total=len(documents))
+
+    persist_dir = Path(settings.vector_store_dir)
+    persist_dir.mkdir(parents=True, exist_ok=True)
+    vectorstore.dump(str(persist_dir))
 
     return len(documents)
 
 
 def main() -> None:
+    configure_logging()
     settings = Settings.load_for_ingest()
     count = build_index(settings)
-    print(f"Done. Indexed {count} chunks into {settings.chroma_persist_dir}.")
+    print(f"Done. Indexed {count} chunks into {settings.vector_store_dir}.")
 
 
 if __name__ == "__main__":

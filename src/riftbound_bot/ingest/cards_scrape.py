@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 GALLERY_URL = "https://riftbound.chroniclecore.com/gallery"
 CARD_URL_TEMPLATE = "https://riftbound.chroniclecore.com/cards/{card_id}"
@@ -71,6 +77,12 @@ def _clean_effect_text(raw: str) -> str:
     return _KEYWORD_MARKUP_RE.sub(r"\1", raw).strip()
 
 
+@retry(
+    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
+    stop=stop_after_attempt(4),
+    wait=wait_exponential(multiplier=1, min=1, max=20),
+    reraise=True,
+)
 def _fetch_gallery_html(client: httpx.Client) -> str:
     resp = client.get(GALLERY_URL, headers=REQUEST_HEADERS, timeout=30, follow_redirects=True)
     resp.raise_for_status()
@@ -119,7 +131,7 @@ def _extract_card_dicts(html: str) -> list[dict]:
     for segment in segments:
         _, _, value = segment.partition(":")
         value = value.strip()
-        if not value or not (value.startswith("[") or value.startswith("{")):
+        if not value or not value.startswith(("[", "{")):
             continue
         try:
             decoded = json.loads(value)
@@ -167,14 +179,17 @@ def scrape_all_cards() -> list[CardRecord]:
 
 
 def main() -> None:
-    import sys
+    from riftbound_bot.config import Settings
+    from riftbound_bot.ingest.db import get_connection, upsert_cards
+    from riftbound_bot.logging_config import configure_logging
 
+    configure_logging()
+    settings = Settings.load_for_ingest()
     cards = scrape_all_cards()
     records = [card.__dict__ for card in cards]
-    out_path = sys.argv[1] if len(sys.argv) > 1 else "data/cards/cards.json"
-    with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(records, fh, ensure_ascii=False, indent=2)
-    print(f"Wrote {len(records)} cards to {out_path}")
+    with get_connection(settings) as conn:
+        upsert_cards(conn, records)
+    print(f"Upserted {len(records)} cards into Postgres.")
 
 
 if __name__ == "__main__":

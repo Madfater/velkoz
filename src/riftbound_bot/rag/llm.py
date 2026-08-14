@@ -14,6 +14,10 @@ def build_chat_model(base_url: str, api_key: str, model: str, temperature: float
     token gets 401. So a placeholder satisfies the SDK's own validation,
     and default_headers overrides what's actually sent on the wire to
     nothing, only when no real key was configured.
+
+    Explicit timeout/max_retries: the SDK's own defaults would otherwise let
+    a stalled free/flaky gateway hang far longer than a Discord interaction
+    should ever wait.
     """
     if not api_key:
         return ChatOpenAI(
@@ -22,5 +26,14 @@ def build_chat_model(base_url: str, api_key: str, model: str, temperature: float
             model=model,
             temperature=temperature,
             default_headers={"Authorization": ""},
+            timeout=30,
+            max_retries=3,
         )
-    return ChatOpenAI(base_url=base_url, api_key=api_key, model=model, temperature=temperature)
+    return ChatOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        temperature=temperature,
+        timeout=30,
+        max_retries=3,
+    )

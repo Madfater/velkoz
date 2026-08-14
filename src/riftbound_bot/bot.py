@@ -7,19 +7,19 @@ tracking needed.
 from __future__ import annotations
 
 import asyncio
-import logging
 
 import discord
+import structlog
 from discord import app_commands
 from openai import RateLimitError
 
 from riftbound_bot.config import Settings
+from riftbound_bot.logging_config import configure_logging
 from riftbound_bot.rag.chain import RagResult, RiftboundRagChain
 from riftbound_bot.rag.llm import build_chat_model
-from riftbound_bot.rag.vectorstore import get_vectorstore
+from riftbound_bot.rag.vectorstore import build_embeddings, load_vectorstore
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("riftbound_bot")
+logger = structlog.get_logger("riftbound_bot")
 
 MAX_HISTORY_TURNS = 6
 EMBED_COLOR = 0xC89B3C  # Riftbound-adjacent gold
@@ -40,10 +40,10 @@ class RiftboundClient(discord.Client):
         guild = discord.Object(id=self.settings.discord_guild_id)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        logger.info("Synced slash commands to guild %s", self.settings.discord_guild_id)
+        logger.info("bot.commands_synced", guild_id=self.settings.discord_guild_id)
 
     async def on_ready(self) -> None:
-        logger.info("Logged in as %s", self.user)
+        logger.info("bot.ready", user=str(self.user))
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
@@ -58,7 +58,7 @@ class RiftboundClient(discord.Client):
             async with message.channel.typing():
                 result = await self._run_chain(message.content, history)
         except Exception as error:
-            logger.exception("Error handling thread follow-up")
+            logger.exception("bot.thread_followup_failed", channel_id=message.channel.id)
             await message.channel.send(_llm_failure_message(error))
             return
 
@@ -86,12 +86,12 @@ def _answer_embed(result: RagResult) -> discord.Embed:
 
 
 def build_client(settings: Settings) -> RiftboundClient:
-    vectorstore = get_vectorstore(
-        persist_dir=settings.chroma_persist_dir,
-        embedding_base_url=settings.embedding_base_url,
-        embedding_api_key=settings.embedding_api_key,
-        embedding_model=settings.embedding_model,
+    embeddings = build_embeddings(
+        base_url=settings.embedding_base_url,
+        api_key=settings.embedding_api_key,
+        model=settings.embedding_model,
     )
+    vectorstore = load_vectorstore(settings.vector_store_dir, embeddings)
     llm = build_chat_model(
         base_url=settings.generation_base_url,
         api_key=settings.generation_api_key,
@@ -127,8 +127,7 @@ def build_client(settings: Settings) -> RiftboundClient:
             # Threads" permission in this channel shouldn't surface as a
             # command failure — just skip follow-up thread tracking.
             logger.warning(
-                "Missing permission to create a follow-up thread in channel %s",
-                interaction.channel_id,
+                "bot.thread_create_forbidden", channel_id=interaction.channel_id
             )
             return
         client.thread_histories[thread.id] = [("human", question), ("ai", result.answer)]
@@ -140,7 +139,7 @@ def build_client(settings: Settings) -> RiftboundClient:
                 f"問太快了，請再等 {error.retry_after:.0f} 秒。", ephemeral=True
             )
             return
-        logger.exception("Error handling /ask", exc_info=error)
+        logger.exception("bot.ask_failed", exc_info=error)
         original = error.original if isinstance(error, app_commands.CommandInvokeError) else error
         message = _llm_failure_message(original)
         if interaction.response.is_done():
@@ -152,6 +151,7 @@ def build_client(settings: Settings) -> RiftboundClient:
 
 
 def main() -> None:
+    configure_logging()
     settings = Settings.load()
     client = build_client(settings)
     client.run(settings.discord_bot_token)
