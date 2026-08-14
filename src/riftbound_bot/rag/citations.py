@@ -34,13 +34,27 @@ def citation_from_metadata(metadata: dict) -> Citation:
 
 
 def format_citations(metadatas: list[dict]) -> str:
-    """De-duplicated, ordered citation list for the reply's footer/embed field."""
-    seen: set[str] = set()
-    lines: list[str] = []
-    for metadata in metadatas:
+    """De-duplicated citation list for the reply's footer/embed field, each
+    entry carrying the "[來源N]" markers the answer text cites it by.
+
+    The numbers are the 1-based positions in `metadatas`, which is aligned
+    with the "[來源N]" prefixes the chain puts on the context block — not the
+    positions of the rendered lines. Two retrieved chunks can share a label
+    (the same rule reached twice), and numbering the output lines instead
+    would silently shift every entry below such a collapse onto a number
+    belonging to a different source.
+
+    For the same reason a repeated label keeps *all* of its markers
+    ("[來源2][來源5] 規則 805.1") rather than only the first: the model saw
+    both slots in its context and may cite either one.
+    """
+    markers_by_label: dict[str, list[int]] = {}
+    citations: dict[str, Citation] = {}
+    for index, metadata in enumerate(metadatas, start=1):
         citation = citation_from_metadata(metadata)
-        if citation.label in seen:
-            continue
-        seen.add(citation.label)
-        lines.append(f"- {citation.as_markdown()}")
-    return "\n".join(lines)
+        markers_by_label.setdefault(citation.label, []).append(index)
+        citations.setdefault(citation.label, citation)
+    return "\n".join(
+        "".join(f"[來源{index}]" for index in markers) + f" {citations[label].as_markdown()}"
+        for label, markers in markers_by_label.items()
+    )

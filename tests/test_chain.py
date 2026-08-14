@@ -99,14 +99,14 @@ def test_ask_merges_rules_and_cards_pools_by_score():
             "card": [(make_card_doc("OGN-001", "測試卡", "測試卡效果文字。"), 0.6)],
         }
     )
-    llm = FakeLLM("疾行是……[1]")
+    llm = FakeLLM("疾行是……[來源1]")
     chain = RiftboundRagChain(vectorstore=vectorstore, llm=llm, pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("什麼是疾行？")
 
-    assert result.answer == "疾行是……[1]"
+    assert result.answer == "疾行是……[來源1]"
     labels = result.citations_markdown.splitlines()
-    assert labels[0] == "- 規則 805.1"  # higher score, comes first
+    assert labels[0] == "[來源1] 規則 805.1"  # higher score, comes first
     assert "測試卡" in labels[1]
 
 
@@ -117,7 +117,7 @@ def test_ask_filters_each_pool_by_score_threshold_independently():
             "card": [(make_card_doc("OGN-001", "不相關卡", "不相關內容"), 0.1)],
         }
     )
-    llm = FakeLLM("疾行是……[1]")
+    llm = FakeLLM("疾行是……[來源1]")
     chain = RiftboundRagChain(vectorstore=vectorstore, llm=llm, pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("什麼是疾行？")
@@ -158,6 +158,23 @@ def test_ask_includes_history_and_context_in_prompt():
     assert "後續問題" in messages[-1][1]
 
 
+def test_context_block_numbers_sources_with_lai_yuan_markers():
+    # Not a bare "[1]": the rules corpus writes generic energy costs as
+    # bracketed digits too, so a bare marker is indistinguishable from a cost
+    # appearing inside the chunk it labels.
+    rules = [(make_rule_doc("805.1", "額外支付 [1][C] 作為額外費用。"), 0.9)]
+    cards = [(make_card_doc("OGN-245", "團結之印", "團結之印效果文字"), 0.8)]
+    vectorstore = FakeVectorstore({"rule": rules, "card": cards})
+    llm = FakeLLM("回答")
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=llm, pool_per_type=10, k=6, score_threshold=0.45)
+
+    chain.ask("疾行的額外費用是什麼")
+
+    context_block = llm.last_messages[-1][1]
+    assert "[來源1] 額外支付 [1][C] 作為額外費用。" in context_block
+    assert "[來源2] 團結之印效果文字" in context_block
+
+
 def test_ask_queries_both_pools_with_pool_per_type_as_k():
     vectorstore = FakeVectorstore({"rule": [], "card": []})
     chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=15, k=6, score_threshold=0.45)
@@ -174,7 +191,7 @@ def test_exact_card_name_match_is_force_included_even_below_threshold():
     # question, so it must still surface.
     card = make_card_doc("OGN-245", "團結之印", "團結之印（Seal of Unity）效果：橫置：反應—獲得黃色。")
     vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[card])
-    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("可以[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("可以[來源1]"), pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("團結之印可以支付待命的費用嗎")
 
@@ -229,7 +246,7 @@ def test_exact_match_drops_subsumed_shorter_name():
 def test_exact_match_dedups_against_similarity_pool_hit():
     card = make_card_doc("OGN-245", "團結之印", "團結之印效果文字")
     vectorstore = FakeVectorstore({"rule": [], "card": [(card, 0.9)]}, cards=[card])
-    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[來源1]"), pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("團結之印是什麼")
 
@@ -254,7 +271,7 @@ def test_exact_keyword_match_is_force_included_even_below_threshold():
     header = make_keyword_header_doc("811", "待命", "Hidden")
     sub_rule = make_rule_doc("811.1.b", "待命的完整效果等同於：「...你可以支付 [A]...」")
     vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_rule])
-    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("可以[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("可以[來源1]"), pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("團結之印可以支付待命的費用嗎")
 
@@ -285,7 +302,7 @@ def test_exact_keyword_match_dedups_against_similarity_pool_hit_in_subtree():
     vectorstore = FakeVectorstore(
         {"rule": [(sub_rule, 0.9)], "card": []}, rules=[header, sub_rule]
     )
-    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[來源1]"), pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("待命是什麼")
 
@@ -310,7 +327,7 @@ def test_symbol_expansion_pulls_in_definition_referenced_by_exact_match():
     sub_rule = make_rule_doc("811.1.b", "待命的完整效果等同於：「你可以支付 [A]...」")
     symbol_def = make_rule_doc("135.2.e.5", "任意屬性的力量，以旋轉的彩虹符號表示，簡稱為 [A]。")
     vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_rule, symbol_def])
-    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[1][2]"), pool_per_type=10, k=6, score_threshold=0.45)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[來源1][來源2]"), pool_per_type=10, k=6, score_threshold=0.45)
 
     result = chain.ask("待命的費用是什麼")
 
@@ -330,6 +347,37 @@ def test_symbol_expansion_combines_definition_subtree():
     matches = [doc for doc, _ in retrieved if doc.metadata.get("rule_id") == "135.2.e.5"]
     assert len(matches) == 1
     assert "當費用要求 [A] 時" in matches[0].page_content
+
+
+def test_symbol_expansion_pulls_in_definition_referenced_only_by_pool_hit():
+    # No exact card or keyword match here — the symbol arrives purely on a
+    # similarity-ranked chunk. The answer still has to gloss [A] on first
+    # use, so its definition has to be retrieved just the same.
+    pool_rule = make_rule_doc("805.1.a.2", "疾行費用中的「力量」部分可以用 [A] 支付。")
+    symbol_def = make_rule_doc("135.2.e.5", "任意屬性的力量，以旋轉的彩虹符號表示，簡稱為 [A]。")
+    vectorstore = FakeVectorstore({"rule": [(pool_rule, 0.9)], "card": []}, rules=[symbol_def])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("疾行的力量費用可以怎麼付")
+
+    assert "135.2.e.5" in [doc.metadata.get("rule_id") for doc, _ in retrieved]
+
+
+def test_symbol_expansion_from_pool_dedups_the_chunk_it_subsumes():
+    # The pool hit *is* a sub-rule of the definition subtree. Expanding must
+    # not leave both the combined subtree and the individual chunk in the
+    # retrieved set, duplicating that text in the prompt.
+    symbol_def = make_rule_doc("135.2.e.5", "簡稱為 [A]。")
+    symbol_sub = make_rule_doc("135.2.e.5.a", "當費用要求 [A] 時，可以任意屬性的力量支付。")
+    vectorstore = FakeVectorstore(
+        {"rule": [(symbol_sub, 0.9)], "card": []}, rules=[symbol_def, symbol_sub]
+    )
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("[A] 是什麼")
+
+    assert [doc.metadata.get("rule_id") for doc, _ in retrieved] == ["135.2.e.5"]
+    assert "當費用要求 [A] 時" in retrieved[0][0].page_content
 
 
 def test_symbol_expansion_skips_already_included_definition():
