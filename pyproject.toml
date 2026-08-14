@@ -24,6 +24,7 @@ dev = [
 
 [project.scripts]
 riftbound-bot = "riftbound_bot.bot:main"
+riftbound-bootstrap = "riftbound_bot.ingest.bootstrap:main"
 riftbound-build-index = "riftbound_bot.ingest.build_index:main"
 riftbound-rules-sync = "riftbound_bot.ingest.rules_sync:main"
 
