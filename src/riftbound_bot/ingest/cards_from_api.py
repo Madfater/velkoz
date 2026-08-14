@@ -33,14 +33,9 @@ from typing import Any
 import httpx
 import structlog
 from langchain_core.language_models.chat_models import BaseChatModel
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from riftbound_bot.ingest.cards_scrape import CardRecord
+from riftbound_bot.ingest.http import REQUEST_HEADERS, retrying_request
 from riftbound_bot.rag.llm import build_chat_model
 
 logger = structlog.get_logger("riftbound_bot.cards_from_api")
@@ -53,11 +48,9 @@ PAGE_SIZE = 100
 BATCH_SIZE = 20
 # How many times one batch's translation is re-requested before giving up.
 TRANSLATION_ATTEMPTS = 3
-
-REQUEST_HEADERS = {
-    "User-Agent": "riftbound-bot-ingest/0.1 (personal, non-commercial data collection)",
-    "Accept": "application/json",
-}
+# Backstop against a malformed `pages` value turning pagination into an
+# unbounded loop. The corpus is ~1,131 cards over ~12 pages today.
+MAX_PAGES = 200
 
 # chroniclecore stores `color` as an English colour word rather than the
 # domain name, so the fallback matches that vocabulary to keep both sources
@@ -245,25 +238,57 @@ def _clean_name(raw: str) -> str:
     return (raw or "").strip()
 
 
-def _printing_rank(raw: dict[str, Any]) -> tuple[bool, bool, bool, str]:
-    """Sort key that prefers a card's base printing over its alternate-art,
-    signature, and overnumbered reprints.
+def _printing_rank(raw: dict[str, Any]) -> tuple[bool, bool, bool, bool, bool, int]:
+    """Sort key that prefers a card's base printing over its reprints.
 
     This is not just cosmetic: alternate-art printings omit the parenthetical
     reminder text that spells out each keyword, so the base printing carries
     strictly more of what a rules bot needs to retrieve.
+
+    `metadata` only flags three of the eight printing variants this API emits;
+    the rest (Metal, Starter, Ultimate, Launch Exclusive, GG EZ) announce
+    themselves only in the trailing parenthetical of the name, which is what
+    the qualifier check picks up. Without it a Metal reprint carried none of
+    the ranked flags and won or lost on the tiebreak alone.
     """
     meta = raw.get("metadata") or {}
+    name = raw.get("name") or ""
+    tcgplayer_id = raw.get("tcgplayer_id")
+    try:
+        # Numeric: as strings "10" sorts before "9". Missing ids sort last so a
+        # printing with an id always beats one without.
+        rank_id = int(tcgplayer_id)
+    except (TypeError, ValueError):
+        rank_id = None
     return (
         bool(meta.get("alternate_art")),
         bool(meta.get("signature")),
         bool(meta.get("overnumbered")),
-        str(raw.get("tcgplayer_id") or ""),
+        _clean_name(name) != name.strip(),
+        rank_id is None,
+        rank_id if rank_id is not None else 0,
     )
 
 
 def _map_tags(tags: list[str]) -> list[str]:
     return [_TRAIT_TAGS.get(tag, tag) for tag in tags]
+
+
+def _collector_number(raw: dict[str, Any]) -> str:
+    # Explicitly against None: `or ""` turned a collector number of 0 into
+    # "000" via the empty string rather than through zfill.
+    number = raw.get("collector_number")
+    return ("" if number is None else str(number)).zfill(3)
+
+
+def _card_id(raw: dict[str, Any]) -> str:
+    """The `SET-NNN` id both the dedupe pass and normalization key on.
+
+    Shared so the two can't derive it differently — they did, and a divergence
+    would silently make dedupe group by something other than the final id.
+    """
+    set_code = str((raw.get("set") or {}).get("set_id") or "")
+    return f"{set_code}-{_collector_number(raw)}"
 
 
 def _normalize_card(raw: dict[str, Any]) -> ApiCard:
@@ -273,10 +298,10 @@ def _normalize_card(raw: dict[str, Any]) -> ApiCard:
     set_info = raw.get("set") or {}
 
     set_code = str(set_info.get("set_id") or "")
-    collector_number = str(raw.get("collector_number") or "").zfill(3)
+    collector_number = _collector_number(raw)
     domains = classification.get("domain") or []
     return ApiCard(
-        id=f"{set_code}-{collector_number}",
+        id=_card_id(raw),
         name_en=_clean_name(raw.get("name") or ""),
         text_en=_clean_text(text.get("rich") or ""),
         set=set_code,
@@ -293,12 +318,7 @@ def _normalize_card(raw: dict[str, Any]) -> ApiCard:
     )
 
 
-@retry(
-    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=1, min=1, max=20),
-    reraise=True,
-)
+@retrying_request
 def _fetch_page(client: httpx.Client, page: int) -> dict[str, Any]:
     resp = client.get(
         API_CARDS_URL,
@@ -321,10 +341,7 @@ def _dedupe_printings(raw_cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     best: dict[str, dict[str, Any]] = {}
     for raw in raw_cards:
-        card_id = (
-            f"{(raw.get('set') or {}).get('set_id') or ''}-"
-            f"{str(raw.get('collector_number') or '').zfill(3)}"
-        )
+        card_id = _card_id(raw)
         if card_id not in best or _printing_rank(raw) < _printing_rank(best[card_id]):
             best[card_id] = raw
     return list(best.values())
@@ -337,8 +354,17 @@ def fetch_api_cards() -> list[ApiCard]:
         page = 1
         while True:
             payload = _fetch_page(client, page)
-            raw_cards.extend(payload.get("items") or [])
-            if page >= (payload.get("pages") or 1):
+            items = payload.get("items") or []
+            raw_cards.extend(items)
+            total_pages = payload.get("pages")
+            if total_pages is None:
+                # Without this the old `or 1` treated a renamed/absent key as
+                # "one page total" and returned the first 100 cards as if that
+                # were the whole corpus.
+                logger.warning("cards_from_api.missing_page_count", page=page, fetched=len(raw_cards))
+            logger.info("cards_from_api.fetched_page", page=page, of=total_pages, cards=len(items))
+            reached_last_page = total_pages is not None and page >= total_pages
+            if not items or reached_last_page or page >= MAX_PAGES:
                 break
             page += 1
 

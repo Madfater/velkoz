@@ -17,23 +17,23 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
+import structlog
+
+from riftbound_bot.ingest.http import REQUEST_HEADERS, retrying_request
+
+logger = structlog.get_logger("riftbound_bot.cards_scrape")
 
 GALLERY_URL = "https://riftbound.chroniclecore.com/gallery"
 CARD_URL_TEMPLATE = "https://riftbound.chroniclecore.com/cards/{card_id}"
 
+# The captured group is a JSON string literal, so the lazy quantifier stops at
+# the first `"])` — a payload containing that sequence inside an escaped string
+# would truncate the match and hand json.loads a partial literal. Not observed
+# on this site, but it's the failure mode to suspect if decoding starts failing
+# on a page that clearly still contains card data.
 _PUSH_RE = re.compile(r"self\.__next_f\.push\(\[1,(\".*?\")\]\)", re.DOTALL)
 _SEGMENT_RE = re.compile(r"\n(?=[0-9a-f]+:)")
 _KEYWORD_MARKUP_RE = re.compile(r"\{\{(.*?)\}\}")
-
-REQUEST_HEADERS = {
-    "User-Agent": "riftbound-bot-ingest/0.1 (personal, non-commercial data collection)"
-}
 
 
 @dataclass(frozen=True)
@@ -77,12 +77,7 @@ def _clean_effect_text(raw: str) -> str:
     return _KEYWORD_MARKUP_RE.sub(r"\1", raw).strip()
 
 
-@retry(
-    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=1, min=1, max=20),
-    reraise=True,
-)
+@retrying_request
 def _fetch_gallery_html(client: httpx.Client) -> str:
     resp = client.get(GALLERY_URL, headers=REQUEST_HEADERS, timeout=30, follow_redirects=True)
     resp.raise_for_status()
@@ -95,7 +90,13 @@ def _extract_rsc_payload(html: str) -> str:
     a single logical segment can be split across chunk boundaries.
     """
     chunks = _PUSH_RE.findall(html)
-    return "".join(json.loads(chunk) for chunk in chunks)
+    try:
+        return "".join(json.loads(chunk) for chunk in chunks)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Could not decode the gallery page's RSC push chunks — the site's "
+            "internal structure may have changed. Fall back to cards_from_api.py."
+        ) from error
 
 
 def _find_card_array(obj: Any) -> list[dict] | None:
@@ -135,7 +136,13 @@ def _extract_card_dicts(html: str) -> list[dict]:
             continue
         try:
             decoded = json.loads(value)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            # Most segments legitimately aren't JSON; log enough to tell that
+            # apart from the card segment itself failing to decode, which
+            # would otherwise surface as the misleading "structure changed".
+            logger.debug(
+                "cards_scrape.segment_skipped", prefix=value[:60], error=str(error)
+            )
             continue
         found = _find_card_array(decoded)
         if found is not None:

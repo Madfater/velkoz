@@ -1,9 +1,11 @@
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from riftbound_bot.ingest.cards_from_api import (
+    API_CARDS_URL,
     TRANSLATION_ATTEMPTS,
     ApiCard,
     TranslationBatchError,
@@ -13,7 +15,9 @@ from riftbound_bot.ingest.cards_from_api import (
     _normalize_card,
     _parse_batch_response,
     _translate_batch,
+    fetch_api_cards,
 )
+from riftbound_bot.ingest.http import is_retryable
 
 
 def test_rules_lines_are_split_on_rich_text_breaks():
@@ -119,6 +123,36 @@ def test_dedupe_collapses_rows_sharing_a_collector_number():
     deduped = _dedupe_printings([metal, plain, other])
     assert len(deduped) == 2
     assert {_normalize_card(c).id for c in deduped} == {"UNL-121", "UNL-122"}
+    # Which row survives is the point of the collapse, not just how many.
+    assert plain in deduped and metal not in deduped
+
+
+def test_dedupe_prefers_the_base_printing_over_a_name_only_qualifier():
+    # Metal/Starter/Ultimate carry no metadata flag at all — the qualifier is
+    # only visible in the trailing parenthetical of the name.
+    metal = _raw_card(name="Bewitching Spirit (Metal)")
+    plain = _raw_card()
+    assert _dedupe_printings([metal, plain]) == [plain]
+    assert _dedupe_printings([plain, metal]) == [plain]
+
+
+def test_dedupe_tiebreak_compares_tcgplayer_ids_numerically():
+    # As strings "10" sorts before "9", picking the wrong printing.
+    lower = _raw_card(tcgplayer_id="9")
+    higher = _raw_card(tcgplayer_id="10")
+    assert _dedupe_printings([higher, lower]) == [lower]
+
+
+def test_dedupe_prefers_a_printing_that_has_a_tcgplayer_id():
+    identified = _raw_card(tcgplayer_id="7")
+    unidentified = _raw_card(tcgplayer_id=None)
+    assert _dedupe_printings([unidentified, identified]) == [identified]
+
+
+def test_collector_number_zero_is_padded_not_blanked():
+    # `or ""` treated 0 as absent, so the id became UNL-000 by accident
+    # rather than by padding.
+    assert _normalize_card(_raw_card(collector_number=0)).collector_number == "000"
 
 
 def test_cards_without_rules_text_normalize_to_empty_string():
@@ -223,3 +257,76 @@ def test_translate_batch_raises_once_attempts_are_exhausted():
     with pytest.raises(TranslationBatchError):
         _translate_batch(llm, batch)
     assert llm.calls == TRANSLATION_ATTEMPTS
+
+
+class _FakePager:
+    """Stands in for the paged /cards endpoint."""
+
+    def __init__(self, pages: list[dict]):
+        self.pages = pages
+        self.requested: list[int] = []
+
+    def __call__(self, client, page):
+        self.requested.append(page)
+        return self.pages[page - 1]
+
+
+def _page(items: list[dict], pages: int | None) -> dict:
+    payload: dict = {"items": items}
+    if pages is not None:
+        payload["pages"] = pages
+    return payload
+
+
+def test_fetch_pages_through_the_whole_list(monkeypatch):
+    pager = _FakePager([
+        _page([_raw_card(collector_number=1)], pages=2),
+        _page([_raw_card(collector_number=2)], pages=2),
+    ])
+    monkeypatch.setattr("riftbound_bot.ingest.cards_from_api._fetch_page", pager)
+
+    cards = fetch_api_cards()
+
+    assert pager.requested == [1, 2]
+    assert {c.id for c in cards} == {"UNL-001", "UNL-002"}
+
+
+def test_fetch_stops_on_an_empty_page_rather_than_looping(monkeypatch):
+    # A `pages` count larger than the data would otherwise keep requesting.
+    pager = _FakePager([
+        _page([_raw_card(collector_number=1)], pages=99),
+        _page([], pages=99),
+    ])
+    monkeypatch.setattr("riftbound_bot.ingest.cards_from_api._fetch_page", pager)
+
+    assert {c.id for c in fetch_api_cards()} == {"UNL-001"}
+    assert pager.requested == [1, 2]
+
+
+def test_fetch_without_a_page_count_does_not_silently_truncate(monkeypatch):
+    # `pages` missing used to mean "one page", quietly returning the first
+    # 100 of ~1,131 cards as though that were the whole corpus.
+    pager = _FakePager([
+        _page([_raw_card(collector_number=1)], pages=None),
+        _page([_raw_card(collector_number=2)], pages=None),
+        _page([], pages=None),
+    ])
+    monkeypatch.setattr("riftbound_bot.ingest.cards_from_api._fetch_page", pager)
+
+    assert {c.id for c in fetch_api_cards()} == {"UNL-001", "UNL-002"}
+
+
+def test_retry_policy_covers_transport_and_server_errors_only():
+    request = httpx.Request("GET", API_CARDS_URL)
+
+    def status_error(code: int) -> httpx.HTTPStatusError:
+        response = httpx.Response(status_code=code, request=request)
+        return httpx.HTTPStatusError("boom", request=request, response=response)
+
+    assert is_retryable(httpx.ConnectError("down", request=request))
+    assert is_retryable(status_error(503))
+    assert is_retryable(status_error(429))
+    # The two documented failure modes of this API: retrying them just repeats
+    # the same deterministic rejection four times.
+    assert not is_retryable(status_error(403))
+    assert not is_retryable(status_error(422))

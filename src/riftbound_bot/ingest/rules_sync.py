@@ -31,6 +31,9 @@ ON CONFLICT (rule_id) DO UPDATE SET data = EXCLUDED.data
 def sync_rules(settings) -> int:
     chunks = parse_rules_dir(settings.rules_dir)
     if not chunks:
+        # Load-bearing beyond the error message: the prune below deletes every
+        # row whose id isn't in `fresh_ids`, and `!= ALL('{}')` is true for
+        # every row — an empty parse would wipe the table rather than no-op.
         raise RuntimeError(f"No rule chunks found under {settings.rules_dir}")
 
     rows = [
@@ -49,7 +52,11 @@ def sync_rules(settings) -> int:
     ]
     fresh_ids = [rule_id for rule_id, _data in rows]
 
-    with get_connection(settings) as conn, conn.cursor() as cur:
+    # One transaction: upsert-then-prune are halves of a single sync, and
+    # under autocommit an interruption between them left the table holding
+    # the new rules plus whatever stale ones the prune hadn't reached yet.
+    # psycopg commits on clean block exit and rolls back on exception.
+    with get_connection(settings, autocommit=False) as conn, conn.cursor() as cur:
         cur.executemany(_UPSERT_SQL, rows)
         cur.execute(f"DELETE FROM {RULES_TABLE} WHERE rule_id != ALL(%s)", (fresh_ids,))
         pruned = cur.rowcount

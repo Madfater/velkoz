@@ -37,11 +37,23 @@ ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data
 """
 
 
-def get_connection(settings: IngestSettings) -> psycopg.Connection:
+def get_connection(settings: IngestSettings, autocommit: bool = True) -> psycopg.Connection:
+    """Opens a connection with the schema already ensured.
+
+    `autocommit=False` is for callers that need several statements to land as
+    one unit (see rules_sync); with the default, every statement commits on
+    its own.
+    """
     # Explicit connect_timeout: a dead/unreachable database should fail fast
     # with a clear error, not hang the ingest script indefinitely.
-    conn = psycopg.connect(settings.database_url, autocommit=True, connect_timeout=3)
-    ensure_schema(conn)
+    conn = psycopg.connect(settings.database_url, autocommit=autocommit, connect_timeout=3)
+    try:
+        ensure_schema(conn)
+    except Exception:
+        # The connection never reaches the caller's `with`, so nothing else
+        # can close it.
+        conn.close()
+        raise
     return conn
 
 
