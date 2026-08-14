@@ -37,3 +37,26 @@ RiftJudge (riftjudge.com) already offers English Riftbound rules Q&A as a Discor
 - Automated data-ingestion pipeline for new sets/errata
 - Public multi-server distribution
 - Simplified Chinese support
+
+## Implementation deviations
+
+Where the built system differs from the choices above, and why.
+
+**TurboVec, not Chroma** — an embedded, quantized vector index rather than a full vector
+database server. No separate container to run, same "local file, no network service" shape
+Chroma had.
+
+**Postgres, not MongoDB** — MongoDB 5.0+ requires a CPU with AVX support, which the target
+deployment hardware (an Intel Celeron J4105 / Goldmont Plus, no AVX) doesn't have; `mongod`
+would crash on startup. Postgres has no such constraint and gets the same flexible,
+per-record-upsert JSONB storage via one narrow-plus-JSONB table per corpus (see `ingest/db.py`).
+
+**DeepSeek by default, not Claude** — this deviates from the Architecture section above, which
+picked Claude specifically over DeepSeek for grounding/hallucination reasons; DeepSeek's higher
+hallucination rate is exactly what a strict-grounding rules-adjudication tool can least afford.
+The current default (`deepseek-v4-flash-free` via the free `opencode.ai/zen` gateway) trades
+that quality margin for $0 cost. As anticipated above, the swap is a config change rather than a
+rewrite: the same gateway also serves Claude and other frontier models (paid, unlike the
+DeepSeek default), so `GENERATION_MODEL=claude-sonnet-5` switches back without touching code,
+and pointing `GENERATION_API_BASE_URL` elsewhere works for any OpenAI-API-compatible provider.
+See `.env.example`.

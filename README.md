@@ -1,32 +1,12 @@
 # Riftbound 規則 & 卡牌交互 Discord Bot
 
 Traditional Chinese RAG-based Discord bot for Riftbound TCG rules Q&A and card-interaction
-resolution. See [`riftbound-bot-design.md`](riftbound-bot-design.md) for the full design doc.
+resolution. Python + `discord.py` + LangChain, with generation and embeddings going through
+OpenAI-compatible endpoints, [TurboVec](https://github.com/RyanCodrai/turbovec) for the local
+vector index, and PostgreSQL as the ingest-time source of truth for card/rule data.
 
-## Stack
-
-Python + `discord.py` + LangChain, with both generation and embeddings going through
-`langchain-openai` pointed at OpenAI-compatible endpoints (rather than a single fixed provider),
-[TurboVec](https://github.com/RyanCodrai/turbovec) (`turbovec[langchain]`, `TurboQuantVectorStore`)
-for local vector storage, and PostgreSQL (JSONB-backed) as the source of truth for card/rule data
-feeding the index build — see [Data pipeline](#data-pipeline) below. Logging goes through
-`structlog`; the ingest scripts' HTTP calls retry via `tenacity`.
-
-**Why TurboVec, not Chroma**: an embedded, quantized vector index rather than a full vector
-database server — no separate container to run, same "local file, no network service" shape
-Chroma had. **Why Postgres, not MongoDB** (the original plan): MongoDB 5.0+ requires a CPU with
-AVX support, which this project's target deployment hardware (an Intel Celeron J4105 / Goldmont
-Plus, no AVX) doesn't have — `mongod` would crash on startup. Postgres has no such constraint and
-gets the same flexible, per-record-upsert JSONB storage via one narrow-plus-JSONB table per
-corpus (see `ingest/db.py`).
-
-**This deviates from the design doc's original choice of Claude for generation.** The doc
-picked Claude specifically over DeepSeek for grounding/hallucination reasons — DeepSeek's
-higher hallucination rate is exactly what a strict-grounding rules-adjudication tool can least
-afford. The current default (`deepseek-v4-flash-free` via the free `opencode.ai/zen` gateway)
-trades that quality margin for $0 cost. `GENERATION_API_BASE_URL`/`GENERATION_MODEL` are a
-config change, not a rewrite, so switching back to Claude (or anything else OpenAI-API-shaped)
-is one env var edit — see `.env.example`.
+Further reading: [design & decisions](docs/riftbound-bot-design.md) ·
+[retrieval behaviour & known issues](docs/retrieval-notes.md)
 
 ## Setup
 
@@ -44,112 +24,29 @@ Required in `.env`:
 | `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` | your own self-hosted embeddings server — must serve an OpenAI-compatible `/v1/embeddings` endpoint |
 | `DATABASE_URL` | a running Postgres instance — `docker compose up -d postgres` locally, or your own; ingest-time only, the live bot never connects to it |
 
-`GENERATION_API_BASE_URL`/`GENERATION_MODEL` default to the free `opencode.ai/zen` gateway
-(`deepseek-v4-flash-free`) — no key needed, `GENERATION_API_KEY` can stay blank. The same
-gateway also serves Claude and other frontier models under that base URL (paid, unlike the
-DeepSeek default) — set `GENERATION_MODEL=claude-sonnet-5` to switch back to what the design
-doc originally specified without touching any code. Any other OpenAI-API-compatible provider
-works the same way by pointing `GENERATION_API_BASE_URL` at it instead.
+`GENERATION_*` defaults to a free gateway and needs no key. Every other setting, and what it
+does, is documented in [`.env.example`](.env.example).
 
 Bot permissions needed when inviting it: `applications.commands`, `bot` scope with
 `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Read Message History`.
 The **Message Content Intent** must be enabled for the bot in the Developer Portal (needed to
 read follow-up messages inside threads).
 
-## Data pipeline
-
-```
-data/rules/core_rules_zh_tw.md   # self-translated Traditional Chinese rules corpus (authoring source)
-data/turbovec/                   # built vector index (gitignored, rebuild with build_index)
-```
-
-Postgres (`cards`/`rules` tables, JSONB-backed — see `ingest/db.py`) sits between the raw sources
-above and the vector index: `cards_scrape.py`/`cards_from_api.py` upsert scraped cards directly
-into the `cards` table (per-record, not a whole-file replace), `rules_sync.py` parses
-`data/rules/*.md` and upserts into the `rules` table, and `build_index.py` reads both tables to
-build the vector store. This is all ingest-time — the live bot only ever reads the already-built
-`data/turbovec/` index, never Postgres directly (see `rag/vectorstore.py`'s `load_vectorstore`).
-
-### Rules corpus
-
-`data/rules/core_rules_zh_tw.md` currently holds a **sample slice** — the Golden/Silver Rules,
-the start of deck construction, and two full keyword definitions (Accelerate/疾行,
-Deflect/偏斜) — translated from Riot's official Core Rules PDF
-(`playriftbound.com/en-us/rules-hub`), enough to exercise the full pipeline end-to-end.
-
-The full rules book is a larger, deliberate translation task (per the design doc — this is
-meant to be an owned, terminology-consistent translation, not a fan/machine one). To extend it,
-keep transcribing rule-by-rule in the same format documented in the comment at the top of the
-file:
-
-```
-[<official rule id>] <optional short heading>
-<body text — omit if the header line already carries the full rule text inline>
-```
-
-Rule IDs are copied straight from the official PDF's own numbering (e.g. `103.2.d.1`), so the
-translation work maps 1:1 onto the source document.
-
-`build_index.py` prepends a chunk's ancestor *headings* to its embedded content, walking the
-whole chain rather than only the top-level section — short sub-rules like "805.1" are often just
-a few words ("疾行是一種單位能力。") and embed almost meaninglessly without their keyword name
-attached, confirmed by checking real retrieval rankings before landing on this. Only
-heading-shaped ancestors are prepended; see the docstring on `_rule_documents_from_chunks` for
-how those are told apart from rule statements.
-
-After editing the Markdown, sync it into Postgres (upserts by `rule_id`; prunes any row whose id
-no longer appears in the freshly parsed file):
+## Ingest the data
 
 ```bash
-uv run riftbound-rules-sync
+uv run riftbound-cards-scrape    # cards from chroniclecore.com (zh-TW) into Postgres
+uv run riftbound-rules-sync      # parses data/rules/*.md into Postgres
+uv run riftbound-build-index     # reads both tables, builds data/turbovec/
 ```
 
-### Card data
+`riftbound-cards-scrape` depends on an internal data shape of the source site and will break if
+that site changes it; `uv run riftbound-cards-from-api` is the fallback, pulling the
+[Riftcodex](https://riftcodex.com) community API in English and translating it via the
+configured generation model. Both upsert by card `id`, so re-runs update in place.
 
-Card data lives in the `cards` Postgres table, populated from chroniclecore.com
-(符文戰場編年史) in Traditional Chinese — about 1,256 cards at the time of writing, though both
-sources grow with each set:
-
-```bash
-uv run riftbound-cards-scrape
-```
-
-This works by reading a single JSON payload the site's `/gallery` page embeds client-side
-(Next.js RSC data) rather than requesting one page per card — much lighter on the site, but
-it also means it depends on that internal data shape and **will break if the site changes it**.
-If it does, fall back to the English community data source instead:
-
-```bash
-uv run riftbound-cards-from-api
-```
-
-This pulls the [Riftcodex](https://riftcodex.com) community REST API (English, no auth, all
-sets, ~1,131 cards at the time of writing after collapsing alternate-art/foil reprints) and
-translates it via the configured generation model — one API call per 20 cards, using whatever
-`GENERATION_*` settings are active. Each batch is upserted as it is translated, so an
-interrupted run keeps everything it already paid for; a re-run resumes rather than starting
-over. A batch whose translation comes back malformed or describing the wrong cards fails the
-run rather than silently writing the untranslated English into the Chinese columns.
-Both scripts upsert by card `id`, so a re-run updates existing cards in place rather than
-replacing the whole dataset.
-
-### Build the vector index
-
-Re-run this any time the `rules`/`cards` Postgres tables change — it's a full rebuild (fixed
-snapshot, manual refresh, per the design doc; no watch/pipeline). Nothing is written until every
-document has been embedded, so a crash during the embedding pass leaves the previous index
-untouched. The final `dump()` itself writes the index and the docstore as two separate files, so
-a crash inside that short window can still leave the directory mismatched — rerun the build if
-one ever dies mid-write:
-
-```bash
-uv run riftbound-build-index
-```
-
-Each card is embedded with its colour, rarity, energy/power/might and trait tags alongside its
-name and effect text, so attribute questions ("紅色 3 費單位") have something to match on. An
-index built before that change carries the older, sparser card text — rebuild once to pick it
-up.
+Re-run `riftbound-build-index` after either — it's a full rebuild, and the live bot only ever
+reads the built index, never Postgres.
 
 ## Running the bot
 
@@ -172,21 +69,13 @@ docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.bu
 docker compose up -d bot
 ```
 
-The `postgres` service is only ever touched by the `ingest` profile (build_index and the
-scrape/sync scripts) — the `bot` service never connects to it, only the `data/turbovec/` index
-that `build_index` produces (bind-mounted via `./data`). Re-run the `ingest` steps any time the
-rules Markdown or card data changes; `bot` just needs restarting to pick up a fresh index.
+Postgres is only ever touched by the `ingest` profile — `bot` just needs restarting to pick up a
+fresh index. The container runs as uid 1000 so it can write to the bind-mounted `./data`; if
+your host user isn't uid 1000, adjust the `useradd`/`groupadd` lines in the Dockerfile or
+`build_index` won't be able to write the index.
 
-The container runs as uid 1000 so it can write to the bind-mounted `./data`. If your host user
-isn't uid 1000, adjust the `useradd`/`groupadd` lines in the Dockerfile or `build_index` won't
-be able to write the index.
-
-### Deploying
-
-CI builds and pushes the image to GHCR on every push to `main`, then triggers a redeploy via a
-webhook — see `.github/workflows/ci-cd.yml`. Configure `ARCANE_WEBHOOK_URL` (or whatever your
-deploy webhook is) as a GitHub Actions secret; see that workflow file's comments for the
-operational details (pull policy, package visibility, rollback).
+CI builds, pushes to GHCR and triggers a redeploy on every push to `main` — see
+[`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) for the operational details.
 
 ## Tests
 
@@ -194,11 +83,7 @@ operational details (pull policy, package visibility, rollback).
 uv run pytest
 ```
 
-Covers rule-corpus parsing, citation formatting, document construction for the index, the
-Discord command/thread wiring, and the RAG chain's retrieval/prompt/citation behaviour against
-a stubbed retriever + LLM — no API keys needed. `build_index` and real retrieval need your
-embeddings endpoint reachable; getting real *answers* end-to-end also needs your generation
-endpoint reachable and, for the live bot, a Discord bot token.
+No API keys needed — the RAG chain is tested against a stubbed retriever and LLM.
 
 The Postgres integration tests in `tests/test_db.py` are skipped unless `TEST_DATABASE_URL` is
 set, because they **TRUNCATE** the `cards` and `rules` tables of whatever they connect to. Point
@@ -210,92 +95,3 @@ TEST_DATABASE_URL=postgresql://riftbound:riftbound@localhost:5432/riftbound_test
 
 If `TEST_DATABASE_URL` is set but unreachable, those tests **fail** rather than skip, so a
 broken database service can't leave CI green with no SQL coverage.
-
-### Retrieval design note
-
-`RiftboundRagChain` searches rules and cards as two **separate** pools (each filtered by
-`source_type`, `RETRIEVAL_POOL_PER_TYPE` candidates apiece) and merges by score, rather than one
-blended top-k search. The card corpus outnumbers rules ~25 to 1 and is structurally homogeneous
-(short, similarly-shaped strings) — a single combined search let cards drown out genuinely more
-relevant rule chunks even when the rules-only pool ranked the correct answer #1 with a clean
-score margin. See the docstring on `RiftboundRagChain` in `rag/chain.py`.
-
-`RETRIEVAL_SCORE_THRESHOLD` (default 0.5) gates each pool on embedding similarity — it's the
-"nothing relevant was found" cutoff that produces the no-data reply instead of an answer
-assembled from unrelated context.
-
-TurboVec's relevance score is `(raw_cosine + 1) / 2`, so **0.5 means a raw cosine of 0**: it
-discards results that are unrelated or actively anti-correlated, and nothing more. The previous
-default of 0.45 was a Chroma-era raw-cosine value; on TurboVec's scale it corresponds to a
-cosine of ≈ −0.1, which every result clears — so the safety cutoff never fired at all.
-
-0.5 is a floor, not a calibration. To tune it for your own embedding endpoint, run with
-`LOG_LEVEL=DEBUG` and compare the `score_min`/`score_max` the chain logs for a known-relevant
-question against a clearly off-topic one, then set the threshold between the two. That is a
-measurement through the real `vectorstore.py`/`chain.py` path, which is what the bot calls —
-not an isolated script.
-
-## Known issue: card retrieval quality is unresolved for non-exact queries
-
-Even with the separate-pool fix above, asking about a specific card **by its exact name**
-("阿璃-誘人這張卡是什麼效果？" / what does Ahri, Alluring do?) failed to surface that card in
-the top 6 — it ranked 661st out of 1,256 cards, behind unrelated cards, through the real
-`vectorstore.py` code path (not a one-off script).
-
-**Exact-full-name queries are now fixed**, but via a targeted workaround rather than an
-embedding-quality fix: `RiftboundRagChain` (`rag/chain.py`) loads every indexed card's `name_zh`
-once at construction and, per query, force-includes any card whose full name appears literally
-in the question — bypassing similarity scoring entirely for that case. This does **not** help
-fuzzy/partial/misspelled names or pure keyword-effect queries with no literal card name in the
-text (e.g. "哪些卡可以獲得黃色力量？") — those still rely entirely on embedding similarity and
-remain unaddressed. Likely causes for the underlying embedding-quality gap, still untested: the
-embedding model handling short/templated card text differently than prose rules text; how the
-self-hosted endpoint batches large embedding requests. Rules-only retrieval looked much healthier
-in isolated testing but wasn't confirmed through that same production path before this was set
-aside.
-
-One lead is closed: the distance metric is not the cause. TurboVec computes cosine similarity
-unconditionally in the pinned release, with no `similarity=` kwarg to set (see the comment in
-`vectorstore.py`). The underlying embedding-quality gap for non-exact card queries is still
-open. Since then, card documents also embed colour/rarity/stats/tags, which gives
-attribute-shaped questions something to match on — but that is added retrievable surface, not a
-fix for the similarity ranking itself.
-
-**The same problem was independently confirmed for rule keyword sections** on multi-hop
-interaction questions (e.g. "團結之印可以支付待命的費用嗎") — a keyword's decisive sub-rule can
-rank outside the pool even with `build_index.py`'s topic-context prepending. `_exact_keyword_matches`
-in `rag/chain.py` applies the identical exact-substring workaround to rule sections shaped like
-card names (a top-level `[NNN] CJK term（English gloss）` title, e.g. 811 待命（Hidden）), detected
-structurally rather than via a hardcoded keyword list.
-
-A sub-rule buried several levels under a broad section (e.g. `135.2.e.5.a`, under `[135] 規則文字
-（Rules Text）` → `[135.2.e] 符號`) can still fail to surface on similarity search alone even after
-`build_index.py`'s topic-context prepending was generalized to walk the *whole* ancestor-heading
-chain (not just the top-level one — see its docstring for the heading-vs-rule-statement heuristic,
-since every rule in this corpus is written as `[id] text` on one line, so a naive "has a body"
-check can't tell the two apart). That change is real, correctly scoped (a no-op for 805/809/811,
-already shallow), and genuinely improves 135.2.e.5.a's embedded context — but confirmed live its
-similarity score barely moved (0.366 → 0.373, still ~64th/94), nowhere near the top-6 pool. Same
-underlying embedding-quality gap already documented above for cards, independently reconfirmed for
-rules: no amount of context-prepending fixes a similarity model that doesn't rank a specific
-sub-rule above its own broader ancestor section for a multi-hop question.
-
-**Closed via a different mechanism**: `_symbol_expansions` in `rag/chain.py` does a one-hop
-expansion over this corpus's small, closed set of bracket shorthand symbols ([A], [C], [M], [E],
-[R]/[G]/[B]/[O]/[P]/[Y]) — detected structurally via the corpus's own "簡稱為 [X]" phrasing, not a
-hardcoded table. When a force-included exact match's text uses a symbol (e.g. 811's "支付 [A]"),
-that symbol's own defining rule is pulled in too, regardless of its similarity score. Confirmed
-live this closes the loop for the 團結之印/待命 question end-to-end at the retrieval layer: 團結之印
-(exact card match), 811 (exact keyword match), and 135.2.e.5 — which contains 135.2.e.5.a, "[A]
-可以任意屬性的力量支付" — all land in the top-6 context together. (The free generation endpoint hit
-its rate limit while verifying the final LLM-generated answer text; the retrieval-side result is
-deterministic and independently confirmed via `RiftboundRagChain._retrieve()`, not re-run at
-generation time.)
-
-## Known follow-ups
-
-- Card data's top-level `tags` field (champion/region tags) comes from the source site
-  un-localized — some entries are Simplified rather than Traditional Chinese.
-- The rules corpus needs the rest of the Core Rules PDF transcribed (see above).
-- Rule 809.1.c.1's worked example says "一張渾沌（Fury）法術" — 渾沌 means Chaos, not Fury (Fury is
-  狂怒, per the rune cards' data). Pre-existing typo, not touched by this pass.
