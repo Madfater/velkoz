@@ -1,0 +1,57 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-riftbound}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-riftbound}
+      POSTGRES_DB: ${POSTGRES_DB:-riftbound}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Bound to localhost only, for local non-Docker ingest scripts — the
+    # `ingest` service below reaches Postgres over the compose network by
+    # service name instead, no published port needed for that path.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-riftbound}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Never depends_on postgres: the live bot only ever reads the already-built
+  # data/turbovec/ index (see rag/vectorstore.py's load_vectorstore) — it
+  # never connects to Postgres, only the `ingest` profile below does.
+  bot:
+    build: .
+    image: ghcr.io/madfater/riftbound-bot:latest
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+
+  # Not started by `docker compose up` (profile-gated). Run one-off ingest
+  # commands against the same image, e.g.:
+  #   docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.cards_scrape
+  #   docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.rules_sync
+  #   docker compose --profile tools run --rm ingest   # default: build_index
+  ingest:
+    build: .
+    image: ghcr.io/madfater/riftbound-bot:latest
+    profiles: ["tools"]
+    env_file: .env
+    environment:
+      # Always the in-network Postgres, regardless of what DATABASE_URL in
+      # .env points at for local non-Docker use (host-side scripts need
+      # localhost:5432; this container needs the postgres service name).
+      DATABASE_URL: postgresql://${POSTGRES_USER:-riftbound}:${POSTGRES_PASSWORD:-riftbound}@postgres:5432/${POSTGRES_DB:-riftbound}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+    entrypoint: ["python", "-m"]
+    command: ["riftbound_bot.ingest.build_index"]
+
+volumes:
+  postgres_data:

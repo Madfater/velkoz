@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.git/
+.github/
+tests/
+data/turbovec/
+data/chroma/
+.env
+.env.example
+riftbound-bot-design.md
