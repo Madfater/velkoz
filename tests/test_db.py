@@ -59,24 +59,66 @@ def test_upsert_cards_inserts_then_updates_in_place(conn):
     assert rows == [{"id": "C1", "name_zh": "卡一", "rarity": "史詩"}]
 
 
-def test_rules_sync_upserts_and_prunes_stale_rows(conn, tmp_path):
-    from riftbound_bot.ingest.rules_sync import sync_rules
+def test_rules_import_upserts_and_prunes_stale_rows(conn, tmp_path):
+    from riftbound_bot.ingest.rules_import import import_rules
 
-    rules_dir = tmp_path / "rules"
-    rules_dir.mkdir()
-    (rules_dir / "core.md").write_text("[1] 第一條規則。\n[2] 第二條規則。\n", encoding="utf-8")
+    source = tmp_path / "core.md"
+    source.write_text("[1] 第一條規則。\n[2] 第二條規則。\n", encoding="utf-8")
 
-    settings = _settings(rules_dir=str(rules_dir))
-    sync_rules(settings)
+    settings = _settings()
+    import_rules(settings, source)
 
     with conn.cursor() as cur:
         cur.execute("SELECT rule_id FROM rules ORDER BY rule_id")
         assert [row[0] for row in cur.fetchall()] == ["1", "2"]
 
-    # Rule 2 removed from the source file — a re-sync should prune it.
-    (rules_dir / "core.md").write_text("[1] 第一條規則（已修改）。\n", encoding="utf-8")
-    sync_rules(settings)
+    # Rule 2 removed from the source file — a re-import should prune it.
+    source.write_text("[1] 第一條規則（已修改）。\n", encoding="utf-8")
+    import_rules(settings, source)
 
     with conn.cursor() as cur:
         cur.execute("SELECT rule_id, data->>'title' FROM rules")
         assert cur.fetchall() == [("1", "第一條規則（已修改）。")]
+
+
+def test_rules_import_without_prune_keeps_rules_outside_the_source(conn, tmp_path):
+    """Importing one extra file must not wipe the rest of the corpus."""
+    from riftbound_bot.ingest.rules_import import import_rules
+
+    base = tmp_path / "core.md"
+    base.write_text("[1] 第一條規則。\n", encoding="utf-8")
+    import_rules(_settings(), base)
+
+    extra = tmp_path / "extra.md"
+    extra.write_text("[2] 第二條規則。\n", encoding="utf-8")
+    import_rules(_settings(), extra, prune=False)
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT rule_id FROM rules ORDER BY rule_id")
+        assert [row[0] for row in cur.fetchall()] == ["1", "2"]
+
+
+def test_rules_survive_an_export_import_round_trip(conn, tmp_path):
+    """Postgres holds the only live copy of the hand translation, so the way
+    back out has to reproduce it exactly — this is the backup path."""
+    from riftbound_bot.ingest.rules_export import fetch_chunks, render
+    from riftbound_bot.ingest.rules_import import import_rules
+
+    original = "[805] 疾行（Accelerate）\n\n[805.1] 疾行是一種單位能力。\n多行內文的第二段。\n\n[805.10] 第十條。\n"
+    source = tmp_path / "core.md"
+    source.write_text(original, encoding="utf-8")
+    import_rules(_settings(), source)
+
+    exported = render(fetch_chunks(_settings()))
+    # Numeric ordering, not string ordering: 805.10 sorts after 805.1.
+    assert [line for line in exported.splitlines() if line.startswith("[")] == [
+        "[805] 疾行（Accelerate）",
+        "[805.1] 疾行是一種單位能力。",
+        "[805.10] 第十條。",
+    ]
+
+    round_tripped = tmp_path / "round.md"
+    round_tripped.write_text(exported, encoding="utf-8")
+    import_rules(_settings(), round_tripped)
+
+    assert render(fetch_chunks(_settings())) == exported

@@ -26,7 +26,7 @@ from riftbound_bot.config import Settings
 from riftbound_bot.ingest.build_index import build_index
 from riftbound_bot.ingest.cards_scrape import scrape_all_cards
 from riftbound_bot.ingest.db import CARDS_TABLE, get_connection, upsert_cards
-from riftbound_bot.ingest.rules_sync import sync_rules
+from riftbound_bot.ingest.rules_import import import_rules
 from riftbound_bot.logging_config import configure_logging
 from riftbound_bot.rag.vectorstore import index_populated
 
@@ -81,11 +81,10 @@ def bootstrap(settings) -> bool:
             logger.info("bootstrap.index_present")
             return False
 
-    # Rules come from git-tracked Markdown in the image's bind-mounted
-    # data/ — offline, cheap, and sync_rules already upserts-and-prunes to
-    # match the file exactly, so it's simpler to just always run it than to
-    # detect whether the table has drifted from the source.
-    sync_rules(settings)
+    # Rules come from git-tracked Markdown — offline, cheap, and the import
+    # already upserts-and-prunes to match the source exactly, so it's simpler
+    # to just always run it than to detect whether the table has drifted.
+    import_rules(settings, settings.rules_dir)
     _ensure_cards(settings)
 
     count = build_index(settings)

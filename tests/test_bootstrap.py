@@ -94,7 +94,7 @@ def test_bootstrap_is_a_noop_when_the_index_is_already_built(conn, monkeypatch):
     def fail(*args, **kwargs):
         raise AssertionError("a warm deployment must not re-run ingest")
 
-    monkeypatch.setattr(bootstrap_module, "sync_rules", fail)
+    monkeypatch.setattr(bootstrap_module, "import_rules", fail)
     monkeypatch.setattr(bootstrap_module, "_ensure_cards", fail)
     monkeypatch.setattr(bootstrap_module, "build_index", fail)
 
@@ -103,7 +103,7 @@ def test_bootstrap_is_a_noop_when_the_index_is_already_built(conn, monkeypatch):
 
 def test_bootstrap_populates_postgres_before_indexing_it(conn, monkeypatch):
     calls = []
-    monkeypatch.setattr(bootstrap_module, "sync_rules", lambda s: calls.append("rules"))
+    monkeypatch.setattr(bootstrap_module, "import_rules", lambda s, src: calls.append("rules"))
     monkeypatch.setattr(bootstrap_module, "_ensure_cards", lambda s: calls.append("cards"))
     monkeypatch.setattr(
         bootstrap_module, "build_index", lambda s: calls.append("index") or 7
