@@ -3,6 +3,10 @@ thread spawned from the bot's own reply, and treats any further message
 posted in that thread as a follow-up (with prior Q&A as context) — this is
 the "conversation" signal from the design doc, no hand-rolled session
 tracking needed.
+
+Per-thread state is in-memory and therefore disposable: the bot adopts any
+thread it owns when a message arrives in one, so a restart costs the prior
+turns of a conversation but never the ability to answer in it.
 """
 from __future__ import annotations
 
@@ -26,6 +30,35 @@ logger = structlog.get_logger("riftbound_bot")
 MAX_HISTORY_TURNS = 6
 EMBED_COLOR = 0xC89B3C  # Riftbound-adjacent gold
 
+# Discord's own payload limits. Exceeding any of them is a 400 that would
+# surface as a generic command failure after the answer was already computed.
+EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FIELD_LIMIT = 1024
+QUESTION_MAX_LENGTH = 500
+THREAD_NAME_MAX_LENGTH = 90
+THREAD_AUTO_ARCHIVE_MINUTES = 1440  # 24h
+
+EMPTY_ANSWER_REPLY = "AI 沒有回覆任何內容，請再試一次。"
+
+
+class ThreadSession:
+    """One tracked Q&A thread: its history plus a lock serialising work on it.
+
+    The lock matters because a thread is a conversation — two messages posted
+    while a chain call is in flight would otherwise both read the same
+    pre-existing history, answer without seeing each other, and append in
+    whatever order they happened to finish.
+    """
+
+    def __init__(self, history: list[tuple[str, str]] | None = None) -> None:
+        self.history: list[tuple[str, str]] = list(history or [])
+        self.lock = asyncio.Lock()
+
+    def record(self, question: str, answer: str) -> None:
+        self.history.append(("human", question))
+        self.history.append(("ai", answer))
+        del self.history[: max(0, len(self.history) - MAX_HISTORY_TURNS * 2)]
+
 
 class RiftboundClient(discord.Client):
     def __init__(self, settings: Settings, chain: RiftboundRagChain) -> None:
@@ -35,8 +68,10 @@ class RiftboundClient(discord.Client):
         self.settings = settings
         self.chain = chain
         self.tree = app_commands.CommandTree(self)
-        # thread_id -> alternating [("human", q), ("ai", a), ...], most recent last.
-        self.thread_histories: dict[int, list[tuple[str, str]]] = {}
+        # thread_id -> ThreadSession. Populated by /ask, and by adopting any
+        # thread this bot owns (see _session_for), so histories survive the
+        # restart that would otherwise orphan every existing thread.
+        self.thread_sessions: dict[int, ThreadSession] = {}
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.settings.discord_guild_id)
@@ -47,30 +82,70 @@ class RiftboundClient(discord.Client):
     async def on_ready(self) -> None:
         logger.info("bot.ready", user=str(self.user))
 
+    def _session_for(self, thread: discord.Thread) -> ThreadSession | None:
+        """The session for a thread, adopting bot-owned threads on sight.
+
+        Sessions live in memory only, so without adoption a restart left every
+        existing Q&A thread permanently unanswered — and a message posted in
+        the gap between creating a thread and registering it was dropped too.
+        An adopted thread starts with no history rather than none at all.
+        """
+        session = self.thread_sessions.get(thread.id)
+        if session is not None:
+            return session
+        if self.user is not None and thread.owner_id == self.user.id:
+            return self.thread_sessions.setdefault(thread.id, ThreadSession())
+        return None
+
+    def forget_thread(self, thread_id: int) -> None:
+        self.thread_sessions.pop(thread_id, None)
+
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        self.forget_thread(payload.thread_id)
+
+    async def on_thread_update(self, before: discord.Thread, after: discord.Thread) -> None:
+        # Archived threads are done; keeping their history would grow the map
+        # for the lifetime of the process.
+        if after.archived and not before.archived:
+            self.forget_thread(after.id)
+
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot:
             return
         if not isinstance(message.channel, discord.Thread):
             return
-        history = self.thread_histories.get(message.channel.id)
-        if history is None:
+        session = self._session_for(message.channel)
+        if session is None:
             return  # not a thread this bot is tracking
 
+        async with session.lock:
+            try:
+                async with message.channel.typing():
+                    result = await self.run_chain(message.content, session.history)
+            except discord.DiscordException:
+                # A Discord-side failure (typing indicator, permissions) is
+                # not the AI failing, and telling the user otherwise is
+                # actively misleading. Nothing to reply through either.
+                logger.exception("bot.thread_discord_error", channel_id=message.channel.id)
+                return
+            except Exception as error:
+                logger.exception("bot.thread_followup_failed", channel_id=message.channel.id)
+                await self._try_send(message.channel, content=_llm_failure_message(error))
+                return
+
+            session.record(message.content, result.answer)
+
+        await self._try_send(message.channel, embed=_answer_embed(result))
+
+    async def _try_send(self, channel: discord.abc.Messageable, **kwargs) -> None:
+        """Best-effort send: the recovery path can't itself raise out of the
+        event handler (an archived thread or a revoked permission would)."""
         try:
-            async with message.channel.typing():
-                result = await self._run_chain(message.content, history)
-        except Exception as error:
-            logger.exception("bot.thread_followup_failed", channel_id=message.channel.id)
-            await message.channel.send(_llm_failure_message(error))
-            return
+            await channel.send(allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+        except discord.DiscordException:
+            logger.exception("bot.send_failed", channel_id=getattr(channel, "id", None))
 
-        history.append(("human", message.content))
-        history.append(("ai", result.answer))
-        del history[: max(0, len(history) - MAX_HISTORY_TURNS * 2)]
-
-        await message.channel.send(embed=_answer_embed(result))
-
-    async def _run_chain(self, question: str, history: list[tuple[str, str]]) -> RagResult:
+    async def run_chain(self, question: str, history: list[tuple[str, str]]) -> RagResult:
         return await asyncio.to_thread(self.chain.ask, question, list(history))
 
 
@@ -80,10 +155,27 @@ def _llm_failure_message(error: BaseException) -> str:
     return "發生未預期的錯誤，請稍後再試一次。"
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Trims to Discord's limit, marking that something was cut."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
 def _answer_embed(result: RagResult) -> discord.Embed:
-    embed = discord.Embed(description=result.answer, color=EMBED_COLOR)
+    # An empty description is a 400 from Discord, and the LLM returning
+    # nothing is a real (if rare) outcome — an unhelpful reply beats a
+    # command that appears to fail after the work was done.
+    embed = discord.Embed(
+        description=_truncate(result.answer or EMPTY_ANSWER_REPLY, EMBED_DESCRIPTION_LIMIT),
+        color=EMBED_COLOR,
+    )
     if result.citations_markdown:
-        embed.add_field(name="來源", value=result.citations_markdown, inline=False)
+        embed.add_field(
+            name="來源",
+            value=_truncate(result.citations_markdown, EMBED_FIELD_LIMIT),
+            inline=False,
+        )
     return embed
 
 
@@ -124,28 +216,43 @@ def build_client(
     @client.tree.command(name="ask", description="詢問 Riftbound 規則或卡牌交互問題")
     @app_commands.describe(question="你的問題，例如：暴怒屬性的疾行是什麼意思？")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
-    async def ask(interaction: discord.Interaction, question: str) -> None:
+    async def ask(
+        # Bounded because the question is echoed back inside a message, and
+        # Discord would otherwise accept a 6000-character option into a
+        # 2000-character message.
+        interaction: discord.Interaction,
+        question: app_commands.Range[str, 1, QUESTION_MAX_LENGTH],
+    ) -> None:
         await interaction.response.defer(thinking=True)
-        result = await client._run_chain(question, [])
-        await interaction.followup.send(
-            content=f"**問題：** {question}", embed=_answer_embed(result)
+        result = await client.run_chain(question, [])
+        # wait=True to get the message back: original_response() returns the
+        # "thinking" placeholder created by defer(), so threading off it hung
+        # the conversation on a different message than the one carrying the
+        # answer. The question is echoed verbatim, so mentions are disarmed.
+        reply_message = await interaction.followup.send(
+            content=f"**問題：** {question}",
+            embed=_answer_embed(result),
+            wait=True,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
 
-        reply_message = await interaction.original_response()
         try:
             thread = await reply_message.create_thread(
-                name=question[:90] or "Riftbound 問答",
-                auto_archive_duration=1440,
+                name=question[:THREAD_NAME_MAX_LENGTH] or "Riftbound 問答",
+                auto_archive_duration=THREAD_AUTO_ARCHIVE_MINUTES,
             )
-        except discord.Forbidden:
-            # Answer was already delivered above; a missing "Create Public
-            # Threads" permission in this channel shouldn't surface as a
-            # command failure — just skip follow-up thread tracking.
+        except (discord.DiscordException, ValueError, TypeError):
+            # The answer is already delivered, so nothing here should surface
+            # as a command failure. Covers a missing "Create Public Threads"
+            # permission, /ask used inside an existing thread (threads can't
+            # nest), and forum channels.
             logger.warning(
-                "bot.thread_create_forbidden", channel_id=interaction.channel_id
+                "bot.thread_create_failed", channel_id=interaction.channel_id, exc_info=True
             )
             return
-        client.thread_histories[thread.id] = [("human", question), ("ai", result.answer)]
+        client.thread_sessions[thread.id] = ThreadSession(
+            [("human", question), ("ai", result.answer)]
+        )
 
     @ask.error
     async def ask_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
