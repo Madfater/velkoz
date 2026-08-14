@@ -12,4 +12,4 @@ data/cards/
 .ruff_cache/
 .env
 .env.example
-riftbound-bot-design.md
+docs/

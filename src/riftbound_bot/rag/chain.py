@@ -102,9 +102,8 @@ class RiftboundRagChain:
     mechanism.
 
     The three lexical lookups themselves are built in rag/lexical_index.py.
-    README's "Known issue: card retrieval quality" section records the
-    measurements behind all of this, including what remains unsolved for
-    fuzzy and attribute-only queries.
+    docs/retrieval-notes.md records the measurements behind all of this,
+    including what remains unsolved for fuzzy and attribute-only queries.
     """
 
     def __init__(
