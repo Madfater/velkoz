@@ -90,8 +90,11 @@ jobs:
       # before relying on Redeploy instead.
       #
       # Operational notes:
-      # - Arcane's project pull policy must be "always" so Update actually
-      #   pulls the freshly-pushed :latest tag instead of a cached layer.
+      # - Getting the freshly-pushed :latest instead of a cached layer is
+      #   enforced compose-side by `pull_policy: always` (docker-compose.yml);
+      #   setting Arcane's own project pull policy to "always" too is belt and
+      #   braces. Without either, Update re-runs the stale local image and the
+      #   deploy silently no-ops.
       # - The GHCR package must be public, or the Arcane host needs
       #   `docker login ghcr.io` with a PAT that has read:packages.
       # - Arcane's webhook has no "redeploy this specific version" concept —
