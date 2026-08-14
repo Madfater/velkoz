@@ -8,7 +8,7 @@ import structlog
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from riftbound_bot.rag.citations import format_citations
+from riftbound_bot.rag.citations import citation_marker, format_citations
 from riftbound_bot.rag.vectorstore import RetrievalStore
 
 logger = structlog.get_logger("riftbound_bot.chain")
@@ -46,7 +46,7 @@ SYSTEM_PROMPT = """\
 
 規則：
 1. 只能根據使用者訊息後方提供的「檢索內容」回答問題，不可以使用檢索內容以外的知識或臆測規則。
-2. 回答中的每一個判斷或論點，都必須標註它所依據的來源編號，格式為「[1]」「[2]」等，
+2. 回答中的每一個判斷或論點，都必須標註它所依據的來源編號，格式為「[來源1]」「[來源2]」等，
    對應到檢索內容列出的編號。
 3. 如果檢索內容不足以回答問題（例如問題牽涉到的規則或卡牌沒有出現在檢索內容中），
    必須明確告訴使用者「目前收錄的資料無法回答這個問題」，並可以請使用者換個問法或補充
@@ -54,6 +54,14 @@ SYSTEM_PROMPT = """\
 4. 若使用者描述了一個具體的牌局情境（例如「我打出 X，對手有 Y」），請根據檢索到的規則與
    卡牌文字，逐步解釋交互結果，並在每一步驟標註依據。
 5. 一律使用繁體中文回答，維持簡潔、精確的裁判用語。
+6. 檢索內容中的方括號符號（例如 [A]、[C]、[R]、[1]）是遊戲本身的費用與屬性符號，
+   屬於規則原文的一部分，不是來源編號。來源編號一律寫成「[來源N]」。
+7. 回答中第一次出現的遊戲符號或遊戲術語，都必須讓玩家看得懂：
+   a. 若檢索內容有定義該符號或術語，就在後面用括號附上簡短說明，格式為
+      「該符號（檢索內容中對它的定義）」；說明必須逐字取自檢索內容，不可自行改寫或補充。
+      同一個符號或術語之後再次出現時不用重複說明。
+   b. 若檢索內容只是提到該術語、但沒有定義它（例如「英雄區域」只出現在其他規則的引文中），
+      就在後面標註「（檢索內容未收錄此術語的定義）」，不要自行補充或猜測它的意思。
 """
 
 NO_CONTEXT_REPLY = (
@@ -182,7 +190,7 @@ class RiftboundRagChain:
         (symbol definitions are usually mid-sentence); otherwise the whole
         title must match (keyword headers are exactly "term（gloss）", no
         more, no less — a `search` here would false-positive on inline
-        parentheticals like rule 103.1's "一張冠軍傳奇（Champion Legend）").
+        parentheticals like rule 103.1's "一張英雄傳奇（Champion Legend）").
         """
         by_key: dict[str, Document] = {}
         for doc in chunks:
@@ -249,7 +257,7 @@ class RiftboundRagChain:
         return [(self._rule_docs_by_keyword[name], EXACT_MATCH_SCORE) for name in matches[:MAX_EXACT_MATCH_NAMES]]
 
     def _symbol_expansions(self, docs: list[Document]) -> list[tuple[Document, float]]:
-        """When a force-included document's own text uses a bracket shorthand
+        """When a retrieved document's own text uses a bracket shorthand
         (e.g. 811's cost text says "支付 [A]"), pull in whatever rule defines
         that symbol too, if it isn't already among `docs`. Confirmed live:
         811's force-included text mentions [A], but [A]'s own definition
@@ -259,6 +267,15 @@ class RiftboundRagChain:
         context prepending (see build_index.py). This is a one-hop expansion
         over a small, closed, well-defined symbol vocabulary — not a general
         multi-hop retrieval mechanism.
+
+        `docs` is every document heading for the prompt, not just the
+        force-included ones: the system prompt requires the answer to gloss
+        each symbol it mentions on first use, and a symbol carried in by a
+        similarity-ranked chunk needs its definition just as much as one
+        carried in by an exact match. Without it the model is stuck between
+        the grounding rule and the glossing rule, and correctly reports the
+        symbol as undefined while its definition sits unretrieved in the
+        index.
         """
         included_ids = {doc.metadata.get("rule_id") for doc in docs}
         symbols: set[str] = set()
@@ -294,22 +311,40 @@ class RiftboundRagChain:
             return False
         return rule_id in matched_top_ids or any(rule_id.startswith(f"{top}.") for top in matched_top_ids)
 
+    @classmethod
+    def _without_rule_subtrees(cls, pool: list[tuple], matched_top_ids: set[str]) -> list[tuple]:
+        """Drops pool entries already covered by a force-included subtree.
+        _combine_subtree folds a rule and everything under it into one
+        document, so leaving the individual chunk in would repeat that text
+        in the prompt and burn a second slot on it.
+        """
+        return [
+            item
+            for item in pool
+            if not cls._in_matched_rule_subtree(item[0].metadata.get("rule_id"), matched_top_ids)
+        ]
+
     def _retrieve(self, question: str) -> list[tuple[object, float]]:
         exact_cards = self._exact_name_matches(question)
         exact_keywords = self._exact_keyword_matches(question)
-        symbol_expansions = self._symbol_expansions([doc for doc, _ in exact_cards + exact_keywords])
 
         exact_card_ids = {doc.metadata.get("card_id") for doc, _ in exact_cards}
-        exact_rule_ids = {doc.metadata.get("rule_id") for doc, _ in exact_keywords + symbol_expansions}
+        exact_rule_ids = {doc.metadata.get("rule_id") for doc, _ in exact_keywords}
 
         pool = self._search_pool(question, "rule") + self._search_pool(question, "card")
-        pool = [
-            item
-            for item in pool
-            if item[0].metadata.get("card_id") not in exact_card_ids
-            and not self._in_matched_rule_subtree(item[0].metadata.get("rule_id"), exact_rule_ids)
-        ]
+        pool = [item for item in pool if item[0].metadata.get("card_id") not in exact_card_ids]
+        pool = self._without_rule_subtrees(pool, exact_rule_ids)
         pool.sort(key=lambda item: item[1], reverse=True)
+
+        # Expand over the documents that would actually have reached the
+        # prompt, pool included — a symbol only ever mentioned by a
+        # similarity-ranked chunk still has to be glossable. Each expansion
+        # then displaces the lowest-scored pool entry, exactly as expansions
+        # triggered by an exact match already did.
+        candidates = (exact_cards + exact_keywords + pool)[: self.k]
+        symbol_expansions = self._symbol_expansions([doc for doc, _ in candidates])
+        expansion_ids = {doc.metadata.get("rule_id") for doc, _ in symbol_expansions}
+        pool = self._without_rule_subtrees(pool, expansion_ids)
 
         retrieved = (exact_cards + exact_keywords + symbol_expansions + pool)[: self.k]
         logger.info(
@@ -331,7 +366,8 @@ class RiftboundRagChain:
             return RagResult(answer=NO_CONTEXT_REPLY, citations_markdown="")
 
         context_block = "\n\n".join(
-            f"[{i + 1}] {doc.page_content}" for i, (doc, _score) in enumerate(retrieved)
+            f"{citation_marker(i + 1)} {doc.page_content}"
+            for i, (doc, _score) in enumerate(retrieved)
         )
         messages: list[tuple[str, str]] = [("system", SYSTEM_PROMPT)]
         messages.extend(history or [])

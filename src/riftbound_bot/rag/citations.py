@@ -3,6 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def citation_marker(index: int) -> str:
+    """The token an answer cites source `index` by.
+
+    Deliberately not a bare "[N]": the rules corpus writes generic energy
+    costs as bracketed digits too (805.1.a's "額外支付 [1][C]"), so a bare
+    marker is indistinguishable from a cost inside the very text it labels.
+
+    The chain prefixes each context-block chunk with this, the answer cites
+    it, and format_citations numbers the footer with it — one definition so
+    the three can't drift apart.
+    """
+    return f"[來源{index}]"
+
+
 @dataclass(frozen=True)
 class Citation:
     label: str
@@ -34,13 +48,25 @@ def citation_from_metadata(metadata: dict) -> Citation:
 
 
 def format_citations(metadatas: list[dict]) -> str:
-    """De-duplicated, ordered citation list for the reply's footer/embed field."""
-    seen: set[str] = set()
-    lines: list[str] = []
-    for metadata in metadatas:
+    """De-duplicated citation list for the reply's footer/embed field, each
+    entry carrying the "[來源N]" markers the answer text cites it by.
+
+    The numbers are the 1-based positions in `metadatas`, which is aligned
+    with the "[來源N]" prefixes the chain puts on the context block — not the
+    positions of the rendered lines. Two retrieved chunks can share a label
+    (the same rule reached twice), and numbering the output lines instead
+    would silently shift every entry below such a collapse onto a number
+    belonging to a different source.
+
+    For the same reason a repeated label keeps *all* of its markers
+    ("[來源2][來源5] 規則 805.1") rather than only the first: the model saw
+    both slots in its context and may cite either one.
+    """
+    entries: dict[str, tuple[Citation, list[int]]] = {}
+    for index, metadata in enumerate(metadatas, start=1):
         citation = citation_from_metadata(metadata)
-        if citation.label in seen:
-            continue
-        seen.add(citation.label)
-        lines.append(f"- {citation.as_markdown()}")
-    return "\n".join(lines)
+        entries.setdefault(citation.label, (citation, []))[1].append(index)
+    return "\n".join(
+        "".join(citation_marker(index) for index in indices) + f" {citation.as_markdown()}"
+        for citation, indices in entries.values()
+    )
