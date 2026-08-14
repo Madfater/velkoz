@@ -4,19 +4,40 @@
 
 ```bash
 cp .env.example .env      # fill in the required values (see the README)
-docker compose up -d postgres
-docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.cards_scrape
-docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.rules_sync
-docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.build_index
-docker compose up -d bot
+docker compose up -d
 ```
 
-The `postgres` service is only ever touched by the `ingest` profile (`build_index`
-and the scrape/sync scripts). The `bot` service never connects to it — only to the
-`data/turbovec/` index that `build_index` produces, bind-mounted via `./data`.
+That's the whole deployment. The `bootstrap` service
+([`ingest/bootstrap.py`](../src/riftbound_bot/ingest/bootstrap.py)) runs as an
+init container ahead of `bot`: on a fresh checkout it syncs the rules Markdown
+into Postgres, scrapes card data, and builds the vector index; on an already-built
+deployment it checks for the index and exits immediately. `bot` waits on it via
+`service_completed_successfully`, so it never starts against a missing index.
 
-Re-run the `ingest` steps any time the rules Markdown or card data changes; `bot`
-just needs restarting to pick up a fresh index.
+If bootstrap fails, `bot` won't start and the failure is in `docker compose logs
+bootstrap` — that's deliberate. A bot serving an empty index looks healthy while
+answering every question wrong.
+
+The `bot` service still never connects to Postgres. It only reads the
+`data/turbovec/` index, bind-mounted via `./data`; `postgres` is pulled in as
+`bootstrap`'s dependency, not the bot's.
+
+## Refreshing data
+
+Bootstrap only fills in what's *missing* — it won't re-scrape or re-embed data
+that's already there, since it re-runs on every `up`. Refreshing is deliberate,
+manual work:
+
+```bash
+docker compose --profile tools run --rm ingest riftbound_bot.ingest.cards_scrape
+docker compose --profile tools run --rm ingest riftbound_bot.ingest.rules_sync
+docker compose --profile tools run --rm ingest riftbound_bot.ingest.build_index
+docker compose restart bot
+```
+
+Pass the bare module path, not `python -m <module>`: the image's ENTRYPOINT is
+already `python -m`, so the longer form runs `python -m python -m <module>` and
+fails with `No module named python`.
 
 ## CI/CD
 

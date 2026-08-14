@@ -1,3 +1,31 @@
+# Shared by the two containers that run ingest code — `bootstrap` below and
+# the manual `ingest` profile. Defined once so the two can't drift onto
+# different databases or a different image.
+x-ingest-base: &ingest-base
+  build: .
+  image: ghcr.io/madfater/riftbound-bot:latest
+  # These are the only containers that *write* to the bind-mounted ./data,
+  # so they have to run as whoever owns it on the host. The image's own `app`
+  # user (uid 999) can't: a bind mount keeps the host's ownership, shadowing
+  # the image's chown, so writing the index fails with EACCES. Override
+  # HOST_UID/HOST_GID in .env if `id -u`/`id -g` aren't 1000.
+  #
+  # `bot` deliberately doesn't get this — it only reads the index, which
+  # world-readable 644/755 already allows, so it stays on the image's
+  # unprivileged user.
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  env_file: .env
+  environment:
+    # Always the in-network Postgres, regardless of what DATABASE_URL in
+    # .env points at for local non-Docker use (host-side scripts need
+    # localhost:5432; these containers need the postgres service name).
+    DATABASE_URL: postgresql://${POSTGRES_USER:-riftbound}:${POSTGRES_PASSWORD:-riftbound}@postgres:5432/${POSTGRES_DB:-riftbound}
+  depends_on:
+    postgres:
+      condition: service_healthy
+  volumes:
+    - ./data:/app/data
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -19,9 +47,20 @@ services:
       timeout: 5s
       retries: 10
 
-  # Never depends_on postgres: the live bot only ever reads the already-built
-  # data/turbovec/ index (see rag/vectorstore.py's load_vectorstore) — it
-  # never connects to Postgres, only the `ingest` profile below does.
+  # Init container: builds the index if it's missing, then exits 0. Runs on
+  # every `up` because it's a no-op once the index exists — see
+  # ingest/bootstrap.py. Without it the bot crash-loops on a fresh checkout,
+  # since load_vectorstore refuses to serve an index that isn't there.
+  bootstrap:
+    <<: *ingest-base
+    restart: "no"
+    command: ["riftbound_bot.ingest.bootstrap"]
+
+  # The bot itself still never connects to Postgres — it only reads the
+  # already-built data/turbovec/ index (see rag/vectorstore.py's
+  # load_vectorstore). Its dependency below is on bootstrap having *finished*,
+  # not on a database it talks to; postgres comes along only transitively, as
+  # bootstrap's own dependency.
   bot:
     build: .
     image: ghcr.io/madfater/riftbound-bot:latest
@@ -29,28 +68,22 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
 
-  # Not started by `docker compose up` (profile-gated). Run one-off ingest
-  # commands against the same image, e.g.:
-  #   docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.cards_scrape
-  #   docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.rules_sync
+  # Not started by `docker compose up` (profile-gated). Refreshing data that
+  # bootstrap already populated is deliberate, manual work — run it here.
+  #
+  # The image's ENTRYPOINT is already `python -m`, so pass the bare module
+  # path; typing `python -m ...` again resolves to `python -m python -m ...`
+  # and fails with "No module named python".
+  #   docker compose --profile tools run --rm ingest riftbound_bot.ingest.cards_scrape
+  #   docker compose --profile tools run --rm ingest riftbound_bot.ingest.rules_sync
   #   docker compose --profile tools run --rm ingest   # default: build_index
   ingest:
-    build: .
-    image: ghcr.io/madfater/riftbound-bot:latest
+    <<: *ingest-base
     profiles: ["tools"]
-    env_file: .env
-    environment:
-      # Always the in-network Postgres, regardless of what DATABASE_URL in
-      # .env points at for local non-Docker use (host-side scripts need
-      # localhost:5432; this container needs the postgres service name).
-      DATABASE_URL: postgresql://${POSTGRES_USER:-riftbound}:${POSTGRES_PASSWORD:-riftbound}@postgres:5432/${POSTGRES_DB:-riftbound}
-    depends_on:
-      postgres:
-        condition: service_healthy
-    volumes:
-      - ./data:/app/data
-    entrypoint: ["python", "-m"]
     command: ["riftbound_bot.ingest.build_index"]
 
 volumes:

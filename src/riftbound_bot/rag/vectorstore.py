@@ -14,6 +14,24 @@ from turbovec.langchain import TurboQuantVectorStore
 # ever bumped past 0.8.x).
 BIT_WIDTH = 4
 
+# .dump() writes this side-car next to the index file, and .load() opens it
+# first — so its presence, not the directory's, is what "there is an index
+# here" actually means.
+DOCSTORE_FILENAME = "docstore.json"
+
+
+def index_exists(persist_dir: str) -> bool:
+    """Whether persist_dir holds a *complete* store rather than just a directory.
+
+    build_index creates persist_dir before writing into it, so an
+    interrupted build can leave the directory behind with no docstore in
+    it. Reading a bare directory as "index present" is the wrong answer for
+    both callers: ingest/bootstrap.py would skip the very rebuild it exists
+    to perform, and the bot would then fail on a missing docstore.json deep
+    inside TurboVec instead of the actionable error below.
+    """
+    return (Path(persist_dir) / DOCSTORE_FILENAME).is_file()
+
 
 def build_embeddings(base_url: str, api_key: str, model: str) -> OpenAIEmbeddings:
     """Embeddings via a self-hosted, OpenAI-compatible /v1/embeddings endpoint
@@ -45,9 +63,9 @@ def load_vectorstore(persist_dir: str, embeddings: OpenAIEmbeddings) -> TurboQua
     empty store. This is a real reliability improvement over Chroma's old
     transparent create-or-load behavior, not just parity.
     """
-    if not Path(persist_dir).exists():
+    if not index_exists(persist_dir):
         raise FileNotFoundError(
             f"No vector store at {persist_dir} — run `python -m "
-            "riftbound_bot.ingest.build_index` first."
+            "riftbound_bot.ingest.bootstrap` first."
         )
     return TurboQuantVectorStore.load(persist_dir, embedding=embeddings)

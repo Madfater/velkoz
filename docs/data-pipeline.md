@@ -17,6 +17,15 @@ This is all ingest-time. The live bot only ever reads the already-built
 `data/turbovec/` index, never Postgres directly — see `load_vectorstore` in
 [`rag/vectorstore.py`](../src/riftbound_bot/rag/vectorstore.py).
 
+The sections below describe each step individually. You don't have to run them
+by hand on a fresh deployment:
+[`ingest/bootstrap.py`](../src/riftbound_bot/ingest/bootstrap.py) chains them in
+order (rules sync → card scrape → build index) and is what `docker compose up`
+runs before starting the bot. It only fills in what's missing — it skips the card
+scrape when the `cards` table is already populated, and does nothing at all once
+`data/turbovec/` exists — so refreshing data that's already there is still a
+deliberate manual run of the steps below.
+
 ## Rules corpus
 
 `data/rules/core_rules_zh_tw.md` currently holds a **sample slice** — the

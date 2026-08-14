@@ -33,13 +33,24 @@ required to read follow-up messages inside threads.
 
 ## First run
 
+With Docker, the whole first run is one command — a `bootstrap` init container
+populates Postgres and builds the vector index before the bot starts, and does
+nothing on later runs:
+
 ```bash
-docker compose up -d postgres                             # or point DATABASE_URL at your own
-uv run python -m riftbound_bot.ingest.cards_scrape        # cards  → Postgres
-uv run riftbound-rules-sync                               # rules  → Postgres
-uv run riftbound-build-index                              # both   → data/turbovec/
+docker compose up -d
+```
+
+Outside Docker, the same bootstrap runs as a console script:
+
+```bash
+docker compose up -d postgres    # or point DATABASE_URL at your own
+uv run riftbound-bootstrap       # rules + cards → Postgres → data/turbovec/
 uv run riftbound-bot
 ```
+
+See [docs/data-pipeline.md](docs/data-pipeline.md) for the individual ingest
+steps, and for refreshing data once it's already populated.
 
 Then use `/ask` in your Discord server. The bot replies and spawns a thread from
 its own reply — any further message in that thread is treated as a follow-up with
