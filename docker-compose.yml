@@ -23,6 +23,10 @@ services:
   # data/turbovec/ index (see rag/vectorstore.py's load_vectorstore) — it
   # never connects to Postgres, only the `ingest` profile below does.
   bot:
+    # `build:` is for local development (`docker compose build`). The deploy
+    # host never builds: CI pushes this same tag to GHCR and Arcane pulls it
+    # (see .github/workflows/ci-cd.yml). Keep the tag identical in both
+    # places or a local build will shadow the pulled image.
     build: .
     image: ghcr.io/madfater/riftbound-bot:latest
     restart: unless-stopped
@@ -39,6 +43,7 @@ services:
     build: .
     image: ghcr.io/madfater/riftbound-bot:latest
     profiles: ["tools"]
+    # Same build/image note as the bot service above.
     env_file: .env
     environment:
       # Always the in-network Postgres, regardless of what DATABASE_URL in
@@ -50,8 +55,7 @@ services:
         condition: service_healthy
     volumes:
       - ./data:/app/data
-    entrypoint: ["python", "-m"]
-    command: ["riftbound_bot.ingest.build_index"]
+    command: ["python", "-m", "riftbound_bot.ingest.build_index"]
 
 volumes:
   postgres_data:

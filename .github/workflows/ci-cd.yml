@@ -1,13 +1,21 @@
 name: CI/CD
 
 on:
+  # Only main on push: every other branch is covered by its pull request, and
+  # matching both ran the whole job (two docker builds included) twice.
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     services:
       postgres:
         image: postgres:16-alpine
@@ -32,9 +40,14 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          # Matches .python-version and the Dockerfile; without it uv resolves
+          # whatever satisfies requires-python, which need not be 3.12.
+          python-version: "3.12"
 
       - name: Install dependencies
-        run: uv sync --extra dev
+        # --locked so a pyproject/uv.lock drift fails here rather than being
+        # silently resolved away and then failing the Docker build instead.
+        run: uv sync --locked --extra dev
 
       - name: Lint
         run: uv run ruff check .
@@ -93,5 +106,10 @@ jobs:
       #   it always resolves whatever :latest points to. The sha-<...> tags
       #   above are audit/rollback artifacts only. Rollback = re-tag a known
       #   good sha-<...> as :latest in GHCR, then re-trigger this webhook.
+      # The URL is itself the credential, so it goes through the environment
+      # rather than being interpolated into the command line, where it would
+      # be visible in the runner's process table and in curl's own errors.
       - name: Trigger Arcane redeploy
-        run: curl -fsS -X POST "${{ secrets.ARCANE_WEBHOOK_URL }}"
+        env:
+          ARCANE_WEBHOOK_URL: ${{ secrets.ARCANE_WEBHOOK_URL }}
+        run: curl -fsS -X POST "$ARCANE_WEBHOOK_URL"
