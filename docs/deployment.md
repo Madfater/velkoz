@@ -7,20 +7,38 @@ cp .env.example .env      # fill in the required values (see the README)
 docker compose up -d
 ```
 
-That's the whole deployment. The `bootstrap` service
+That's the whole deployment. There is no data directory to create, own, or
+keep in sync — everything lives in Postgres, and the rules and card corpora
+ship inside the image
+([`ingest/seeds/`](../src/riftbound_bot/ingest/seeds/)).
+
+The `bootstrap` service
 ([`ingest/bootstrap.py`](../src/riftbound_bot/ingest/bootstrap.py)) runs as an
-init container ahead of `bot`: on a fresh checkout it syncs the rules Markdown
-into Postgres, scrapes card data, and builds the vector index; on an already-built
-deployment it checks for the index and exits immediately. `bot` waits on it via
+init container ahead of `bot`: on a fresh database it seeds the rules, loads card
+data, and builds the vector index; on an already-built deployment it checks for
+the index and exits immediately. `bot` waits on it via
 `service_completed_successfully`, so it never starts against a missing index.
+
+A fresh environment needs no manual step and no reachable third-party site: if
+the card scrape breaks, bootstrap falls back to the bundled snapshot.
 
 If bootstrap fails, `bot` won't start and the failure is in `docker compose logs
 bootstrap` — that's deliberate. A bot serving an empty index looks healthy while
 answering every question wrong.
 
-The `bot` service still never connects to Postgres. It only reads the
-`data/turbovec/` index, bind-mounted via `./data`; `postgres` is pulled in as
-`bootstrap`'s dependency, not the bot's.
+Unlike earlier versions, `bot` connects to Postgres itself: it reads the
+`embeddings` table on every request, so `postgres` is its own dependency and not
+merely `bootstrap`'s.
+
+## Backups
+
+Postgres now holds the only live copy of the hand-translated rules. The shipped
+seed is a snapshot, not a backup of anything edited since — so back the database
+up, or export the translation to reviewable Markdown:
+
+```bash
+docker compose --profile tools run --rm ingest riftbound_bot.ingest.rules_export > rules.md
+```
 
 ## Refreshing data
 
@@ -30,9 +48,15 @@ manual work:
 
 ```bash
 docker compose --profile tools run --rm ingest riftbound_bot.ingest.cards_scrape
-docker compose --profile tools run --rm ingest riftbound_bot.ingest.rules_sync
 docker compose --profile tools run --rm ingest riftbound_bot.ingest.build_index
 docker compose restart bot
+```
+
+To change the rules themselves, edit Markdown and import it (the path is an
+argument now — there is no configured rules directory):
+
+```bash
+docker compose --profile tools run --rm ingest riftbound_bot.ingest.rules_import /path/to/rules.md
 ```
 
 Pass the bare module path, not `python -m <module>`: the image's ENTRYPOINT is

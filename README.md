@@ -4,8 +4,9 @@ Traditional Chinese RAG-based Discord bot for Riftbound TCG rules Q&A and
 card-interaction resolution.
 
 Python + `discord.py` + LangChain, with generation and embeddings both going
-through `langchain-openai` against OpenAI-compatible endpoints, TurboVec for the
-local vector index, and PostgreSQL as the ingest-time source of truth. See
+through `langchain-openai` against OpenAI-compatible endpoints, and PostgreSQL
+as the single source of truth — card and rule data *and* the pgvector index the
+bot serves from. There is no local data directory. See
 [docs/decisions.md](docs/decisions.md) for why each of those.
 
 ## Setup
@@ -45,7 +46,7 @@ Outside Docker, the same bootstrap runs as a console script:
 
 ```bash
 docker compose up -d postgres    # or point DATABASE_URL at your own
-uv run riftbound-bootstrap       # rules + cards → Postgres → data/turbovec/
+uv run riftbound-bootstrap       # seeds rules + cards, then builds the index
 uv run riftbound-bot
 ```
 

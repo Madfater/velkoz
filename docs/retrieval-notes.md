@@ -58,10 +58,12 @@ all land in the top-6 context together. Verified at the retrieval layer via
 similarity — it's the "nothing relevant was found" safety cutoff before the LLM is
 even called.
 
-**This default was calibrated against Chroma's raw cosine similarity and has not
-been re-checked since the TurboVec migration.** TurboVec's relevance score is
-`(raw_cosine + 1) / 2`, a different scale — 0.45 there corresponds to a raw cosine
-of only ≈ −0.1, far too permissive.
+**This default was calibrated against Chroma's raw cosine similarity and has
+never been re-checked since.** Both stores since have deliberately kept the same
+`(raw_cosine + 1) / 2` mapping — TurboVec by its own convention, pgvector via
+`_relevance` in `vectorstore.py` — so the migrations didn't move the goalposts,
+but they didn't fix this either: 0.45 on that scale is a raw cosine of only
+≈ −0.1, far too permissive.
 
 To recalibrate: retrieve a known-relevant query and a clearly off-topic one, and
 confirm there's an actual, reproducible score gap between them. Do this through
