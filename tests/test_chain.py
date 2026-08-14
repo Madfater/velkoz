@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 
-from riftbound_bot.rag.chain import MAX_EXACT_MATCH_NAMES, NO_CONTEXT_REPLY, RiftboundRagChain
+from riftbound_bot.rag.chain import (
+    MAX_EXACT_MATCH_NAMES,
+    NO_CONTEXT_REPLY,
+    RiftboundRagChain,
+)
 
 
 @dataclass
@@ -16,10 +20,11 @@ class FakeResponse:
 
 class FakeVectorstore:
     """Keyed by source_type so tests can control each pool independently,
-    mirroring how the real Chroma filter={"source_type": ...} search works.
-    `cards` backs `.get()`, mirroring the real Chroma.get() metadata-only
-    lookup (no embedding call) that RiftboundRagChain uses to load its
-    exact-name-match index at construction time.
+    mirroring how the real TurboQuantVectorStore filter={"source_type": ...}
+    search works. `cards`/`rules` back similarity_search's bulk-fetch calls
+    (large k, no scores) that RiftboundRagChain uses to load its exact-match
+    indexes at construction time — mirrors the real store's "return every
+    matching document once k exceeds the candidate count" behavior.
     """
 
     def __init__(
@@ -32,24 +37,15 @@ class FakeVectorstore:
         self._cards = cards or []
         self._rules = rules or []
         self.calls: list[tuple[str, int, dict]] = []
-        self.get_calls: list[dict] = []
+        self.bulk_fetch_calls: list[dict] = []
 
     def similarity_search_with_relevance_scores(self, query, k, filter):
         self.calls.append((query, k, filter))
         return self._by_type.get(filter["source_type"], [])
 
-    def get(self, where, include=None):
-        self.get_calls.append(where)
-        if where.get("source_type") == "rule":
-            docs = self._rules
-        else:
-            name = where.get("name_zh")
-            docs = self._cards if name is None else [d for d in self._cards if d.metadata.get("name_zh") == name]
-        return {
-            "ids": [d.metadata.get("card_id") or d.metadata.get("rule_id") for d in docs],
-            "metadatas": [d.metadata for d in docs],
-            "documents": [d.page_content for d in docs],
-        }
+    def similarity_search(self, query, k, filter):
+        self.bulk_fetch_calls.append(filter)
+        return self._rules if filter.get("source_type") == "rule" else self._cards
 
 
 class FakeLLM:
@@ -278,7 +274,7 @@ def test_exact_keyword_match_combines_full_subtree_into_one_document():
     retrieved = chain._retrieve("待命是什麼")
 
     assert len(retrieved) == 1
-    doc, score = retrieved[0]
+    doc, _score = retrieved[0]
     assert doc.metadata["rule_id"] == "811"
     assert "待命是一種關鍵字" in doc.page_content
     assert "可以支付 [A]" in doc.page_content
@@ -364,9 +360,9 @@ def test_card_and_rule_indexes_are_loaded_once_at_construction():
     vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[card], rules=[header])
     chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案"), pool_per_type=10, k=6, score_threshold=0.45)
 
-    assert vectorstore.get_calls == [{"source_type": "card"}, {"source_type": "rule"}]
+    assert vectorstore.bulk_fetch_calls == [{"source_type": "card"}, {"source_type": "rule"}]
 
     chain.ask("團結之印是什麼")
     chain.ask("另一個問題")
 
-    assert vectorstore.get_calls == [{"source_type": "card"}, {"source_type": "rule"}]
+    assert vectorstore.bulk_fetch_calls == [{"source_type": "card"}, {"source_type": "rule"}]

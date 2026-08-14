@@ -10,6 +10,21 @@ from riftbound_bot.config import Settings
 from riftbound_bot.rag.chain import RagResult
 
 
+class FakeVectorstore:
+    """No-op stand-in so build_client()'s RiftboundRagChain construction
+    doesn't need a reachable embedding endpoint or an on-disk index — these
+    tests exercise Discord glue (command registration, thread handling,
+    error formatting), not RAG retrieval (see test_chain.py for that)."""
+
+    def similarity_search(self, query, k, filter):
+        return []
+
+
+class FakeLLM:
+    def invoke(self, messages):
+        raise AssertionError("the real chain should never be invoked in these tests")
+
+
 def _rate_limit_error() -> RateLimitError:
     request = httpx.Request("POST", "http://localhost/chat/completions")
     response = httpx.Response(status_code=429, request=request)
@@ -135,11 +150,9 @@ def _build_client(tmp_path):
         retrieval_pool_per_type=10,
         retrieval_k=6,
         retrieval_score_threshold=0.45,
-        chroma_persist_dir=str(tmp_path / "chroma"),
-        rules_dir="data/rules",
-        cards_file="data/cards/cards.json",
+        vector_store_dir=str(tmp_path / "turbovec"),
     )
-    client = build_client(settings)
+    client = build_client(settings, vectorstore=FakeVectorstore(), llm=FakeLLM())
     client.chain = FakeChain()
     return client
 

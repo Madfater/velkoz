@@ -11,6 +11,8 @@ import asyncio
 import discord
 import structlog
 from discord import app_commands
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.vectorstores import VectorStore
 from openai import RateLimitError
 
 from riftbound_bot.config import Settings
@@ -85,18 +87,31 @@ def _answer_embed(result: RagResult) -> discord.Embed:
     return embed
 
 
-def build_client(settings: Settings) -> RiftboundClient:
-    embeddings = build_embeddings(
-        base_url=settings.embedding_base_url,
-        api_key=settings.embedding_api_key,
-        model=settings.embedding_model,
-    )
-    vectorstore = load_vectorstore(settings.vector_store_dir, embeddings)
-    llm = build_chat_model(
-        base_url=settings.generation_base_url,
-        api_key=settings.generation_api_key,
-        model=settings.generation_model,
-    )
+def build_client(
+    settings: Settings,
+    vectorstore: VectorStore | None = None,
+    llm: BaseChatModel | None = None,
+) -> RiftboundClient:
+    """`vectorstore`/`llm` are injectable so tests can exercise the Discord
+    command-registration/error-handling wiring here without needing a
+    reachable embedding endpoint — RiftboundRagChain's constructor does a
+    real embedding call even against an empty store (see chain.py's
+    _load_card_docs_by_name), unlike the old Chroma-backed lookup this
+    replaced, which was a pure metadata call with zero network I/O.
+    """
+    if vectorstore is None:
+        embeddings = build_embeddings(
+            base_url=settings.embedding_base_url,
+            api_key=settings.embedding_api_key,
+            model=settings.embedding_model,
+        )
+        vectorstore = load_vectorstore(settings.vector_store_dir, embeddings)
+    if llm is None:
+        llm = build_chat_model(
+            base_url=settings.generation_base_url,
+            api_key=settings.generation_api_key,
+            model=settings.generation_model,
+        )
     chain = RiftboundRagChain(
         vectorstore=vectorstore,
         llm=llm,
