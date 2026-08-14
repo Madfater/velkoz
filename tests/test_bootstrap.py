@@ -33,7 +33,6 @@ def _settings() -> IngestSettings:
         embedding_base_url="unused",
         embedding_api_key="unused",
         embedding_model="unused",
-        rules_dir="unused",
         database_url=DATABASE_URL,
     )
 

@@ -47,16 +47,15 @@ class Settings:
 
     @classmethod
     def load_for_ingest(cls) -> IngestSettings:
-        """Ingestion only needs the embedding + storage config, not Discord/generation.
+        """Ingestion only needs the embedding + database config, not Discord/generation.
 
-        Both halves now share `database_url`: the vector index lives in the
-        `embeddings` table rather than a local directory, so the bot reads the
-        same database ingestion writes. `rules_dir` stays ingest-only — the
-        bot has never read the rules Markdown source.
+        Both halves now share `database_url` and nothing else: every corpus
+        and the vector index all live in Postgres, so there are no paths left
+        to configure. rules_import takes its source path as an argument
+        instead, since there is no longer a directory the deployment reads.
         """
         return IngestSettings(
             **_embedding_settings_kwargs(),
-            rules_dir=os.environ.get("RULES_DIR", "data/rules"),
             database_url=_require("DATABASE_URL"),
         )
 
@@ -85,5 +84,4 @@ class IngestSettings:
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
-    rules_dir: str
     database_url: str

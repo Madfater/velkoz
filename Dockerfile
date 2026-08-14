@@ -19,15 +19,14 @@ FROM python:3.12-slim-bookworm AS runtime
 
 RUN groupadd --system app && useradd --system --gid app --home-dir /app app
 WORKDIR /app
-RUN mkdir -p /app/data && chown app:app /app/data
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
+# Carries src/riftbound_bot/ingest/seeds/ with it, which is the whole point of
+# keeping those corpora inside the package: nothing is bind-mounted at runtime
+# and the container writes no files, so there is no host directory to exist,
+# own, or keep in sync. All data lives in Postgres.
 COPY --chown=app:app src ./src
 
-# ./data (rules Markdown, the TurboVec index) is bind-mounted at runtime —
-# see docker-compose.yml — so nothing under data/ is baked into the image;
-# a build-time copy would always be shadowed by the mount and risk drifting
-# stale against whatever's actually on the host.
 ENV PATH="/app/.venv/bin:$PATH"
 USER app
 

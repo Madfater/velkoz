@@ -22,12 +22,11 @@ from riftbound_bot.ingest.db import CARDS_TABLE, RULES_TABLE, get_connection
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://riftbound:riftbound@localhost:5432/riftbound")
 
 
-def _settings(rules_dir: str = "unused") -> IngestSettings:
+def _settings() -> IngestSettings:
     return IngestSettings(
         embedding_base_url="unused",
         embedding_api_key="unused",
         embedding_model="unused",
-        rules_dir=rules_dir,
         database_url=DATABASE_URL,
     )
 
