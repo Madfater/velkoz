@@ -178,10 +178,22 @@ operational details (pull policy, package visibility, rollback).
 uv run pytest
 ```
 
-Covers rule-corpus parsing, citation formatting, and the RAG chain's prompt/citation wiring
-against a stubbed retriever + LLM — no API keys needed. `build_index` and real retrieval need
-your embeddings endpoint reachable; getting real *answers* end-to-end also needs your
-generation endpoint reachable and, for the live bot, a Discord bot token.
+Covers rule-corpus parsing, citation formatting, document construction for the index, the
+Discord command/thread wiring, and the RAG chain's retrieval/prompt/citation behaviour against
+a stubbed retriever + LLM — no API keys needed. `build_index` and real retrieval need your
+embeddings endpoint reachable; getting real *answers* end-to-end also needs your generation
+endpoint reachable and, for the live bot, a Discord bot token.
+
+The Postgres integration tests in `tests/test_db.py` are skipped unless `TEST_DATABASE_URL` is
+set, because they **TRUNCATE** the `cards` and `rules` tables of whatever they connect to. Point
+it at a scratch database — never at the `DATABASE_URL` holding your real ingested data:
+
+```bash
+TEST_DATABASE_URL=postgresql://riftbound:riftbound@localhost:5432/riftbound_test uv run pytest
+```
+
+If `TEST_DATABASE_URL` is set but unreachable, those tests **fail** rather than skip, so a
+broken database service can't leave CI green with no SQL coverage.
 
 ### Retrieval design note
 

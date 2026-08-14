@@ -1,15 +1,18 @@
-"""Integration tests against a real (ephemeral) Postgres — no mock captures
+"""Integration tests against a real (scratch) Postgres — no mock captures
 SQL semantics like ON CONFLICT upserts or JSONB round-tripping faithfully
-enough to trust. Skipped when Postgres isn't actually reachable (e.g. plain
-`pytest` locally without it running); CI provides a postgres service
-container.
+enough to trust.
 
-Deliberately probes with a real (short-timeout) connection attempt rather
-than checking whether the DATABASE_URL env var is merely *set* —
-config.py's load_dotenv() is a process-wide side effect of importing
-riftbound_bot.config at all (triggered by other test modules collected
-first, e.g. test_bot.py), so DATABASE_URL can be populated from .env's
-local-dev default even when nothing is actually listening there.
+These tests TRUNCATE the `cards` and `rules` tables, so they deliberately
+read TEST_DATABASE_URL and *never* fall back to DATABASE_URL: the latter is
+populated process-wide from .env by config.py's import-time load_dotenv()
+and normally points at the developer's real, fully-ingested local database.
+Falling back to it would make a plain `pytest` destroy ~1,300 scraped cards
+and the whole rules corpus.
+
+Setting TEST_DATABASE_URL is therefore both the opt-in *and* an assertion
+that the database must be reachable: unset skips, but set-and-unreachable
+fails. That way a dead CI postgres service turns the build red instead of
+silently skipping the only tests covering real SQL.
 """
 import os
 
@@ -19,7 +22,7 @@ import pytest
 from riftbound_bot.config import IngestSettings
 from riftbound_bot.ingest.db import CARDS_TABLE, RULES_TABLE, get_connection
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://riftbound:riftbound@localhost:5432/riftbound")
+TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 
 def _settings(rules_dir: str = "unused") -> IngestSettings:
@@ -29,22 +32,36 @@ def _settings(rules_dir: str = "unused") -> IngestSettings:
         embedding_model="unused",
         vector_store_dir="unused",
         rules_dir=rules_dir,
-        database_url=DATABASE_URL,
+        database_url=TEST_DATABASE_URL or "",
     )
+
+
+def _truncate(connection) -> None:
+    with connection.cursor() as cur:
+        cur.execute(f"TRUNCATE {CARDS_TABLE}, {RULES_TABLE}")
 
 
 @pytest.fixture
 def conn():
+    if not TEST_DATABASE_URL:
+        pytest.skip(
+            "set TEST_DATABASE_URL to a scratch database to run the Postgres "
+            "integration tests — its cards/rules tables get TRUNCATEd"
+        )
     try:
         connection = get_connection(_settings())
-    except psycopg.OperationalError:
-        pytest.skip(f"Postgres not reachable at {DATABASE_URL}")
-    with connection.cursor() as cur:
-        cur.execute(f"TRUNCATE {CARDS_TABLE}, {RULES_TABLE}")
-    yield connection
-    with connection.cursor() as cur:
-        cur.execute(f"TRUNCATE {CARDS_TABLE}, {RULES_TABLE}")
-    connection.close()
+    except psycopg.OperationalError as error:
+        # Set-but-unreachable is a failure, not a skip: otherwise a CI postgres
+        # service that never came up would leave the build green with zero
+        # coverage of the only tests that exercise real SQL.
+        pytest.fail(f"TEST_DATABASE_URL is set but Postgres is unreachable: {error}")
+
+    try:
+        _truncate(connection)
+        yield connection
+        _truncate(connection)
+    finally:
+        connection.close()
 
 
 def test_upsert_cards_inserts_then_updates_in_place(conn):
