@@ -28,9 +28,15 @@ services:
   postgres:
     # pgvector's image, not stock postgres: the `embeddings` table is a
     # `vector` column, and ingest/db.py's CREATE EXTENSION fails on an image
-    # that doesn't ship it. Same major version, so this is a drop-in swap for
-    # the schema — but not for an existing volume, which was initialized by
-    # the musl-based alpine image and must be recreated (`down -v`).
+    # that doesn't ship it — `extension "vector" is not available`, which
+    # exits bootstrap 1 and (via service_completed_successfully) stops `bot`
+    # from ever starting. If the bot won't come up, check this image first.
+    #
+    # Upgrading in place from the old postgres:16-alpine needs no `down -v`:
+    # the swap was verified against an alpine-initialized volume, and the
+    # data survived, the server came up, and CREATE EXTENSION succeeded with
+    # no collation warnings. Don't wipe the volume — it holds the only live
+    # copy of the hand-translated rules (see docs/deployment.md).
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
