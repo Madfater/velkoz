@@ -1,4 +1,4 @@
-"""Postgres access shared by the ingest CLIs (cards_scrape, cards_from_gist,
+"""Postgres access shared by the ingest CLIs (cards_scrape, cards_from_api,
 rules_sync, build_index). Ingest-time only — the live bot never imports this
 module; it reads the already-built vector store instead (see
 rag/vectorstore.py's load_vectorstore).

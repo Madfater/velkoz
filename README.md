@@ -66,7 +66,7 @@ data/turbovec/                   # built vector index (gitignored, rebuild with 
 ```
 
 Postgres (`cards`/`rules` tables, JSONB-backed — see `ingest/db.py`) sits between the raw sources
-above and the vector index: `cards_scrape.py`/`cards_from_gist.py` upsert scraped cards directly
+above and the vector index: `cards_scrape.py`/`cards_from_api.py` upsert scraped cards directly
 into the `cards` table (per-record, not a whole-file replace), `rules_sync.py` parses
 `data/rules/*.md` and upserts into the `rules` table, and `build_index.py` reads both tables to
 build the vector store. This is all ingest-time — the live bot only ever reads the already-built
@@ -119,11 +119,13 @@ it also means it depends on that internal data shape and **will break if the sit
 If it does, fall back to the English community data source instead:
 
 ```bash
-uv run python -m riftbound_bot.ingest.cards_from_gist
+uv run python -m riftbound_bot.ingest.cards_from_api
 ```
 
-This pulls OwenMelbz's community card-data gist and translates it via the configured generation
-model — it costs one API call per 20 cards, using whatever `GENERATION_*` settings are active.
+This pulls the [Riftcodex](https://riftcodex.com) community REST API (English, no auth, all 8
+sets, ~1,131 cards after collapsing alternate-art/foil reprints) and translates it via the
+configured generation model — it costs one API call per 20 cards, using whatever `GENERATION_*`
+settings are active.
 Both scripts upsert by card `id`, so a re-run updates existing cards in place rather than
 replacing the whole dataset.
 
@@ -268,4 +270,4 @@ generation time.)
   狂怒, per the rune cards' data). Pre-existing typo, not touched by this pass.
 - `data/cards/cards.json` is kept as a historical snapshot of the original scrape but is no
   longer read by any code path — safe to delete once you're comfortable relying on Postgres
-  (`cards_scrape.py`/`cards_from_gist.py`) as the source of truth instead.
+  (`cards_scrape.py`/`cards_from_api.py`) as the source of truth instead.

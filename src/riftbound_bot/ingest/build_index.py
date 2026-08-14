@@ -1,6 +1,6 @@
 """CLI: (re)builds the TurboVec vector store from the `rules` and `cards`
 Postgres tables (populated by rules_sync.py / cards_scrape.py /
-cards_from_gist.py). Manual, re-runnable refresh — no ingestion pipeline or
+cards_from_api.py). Manual, re-runnable refresh — no ingestion pipeline or
 watch process, matching the design doc's "fixed snapshot" data model.
 
 Usage:
