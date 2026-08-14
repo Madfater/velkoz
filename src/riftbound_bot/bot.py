@@ -148,7 +148,7 @@ def build_client(
     client = RiftboundClient(settings=settings, chain=chain)
 
     @client.tree.command(name="ask", description="詢問 Riftbound 規則或卡牌交互問題")
-    @app_commands.describe(question="你的問題，例如：暴怒屬性的疾行是什麼意思？")
+    @app_commands.describe(question="你的問題，例如：疾行是什麼意思？")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
     async def ask(interaction: discord.Interaction, question: str) -> None:
         await interaction.response.defer(thinking=True)
