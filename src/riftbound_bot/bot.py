@@ -169,7 +169,10 @@ def main() -> None:
     configure_logging()
     settings = Settings.load()
     client = build_client(settings)
-    client.run(settings.discord_bot_token)
+    # log_handler=None: discord.py otherwise installs its own handler on the
+    # 'discord' logger without clearing propagate, so every library log line
+    # was emitted twice — once in discord's format, once as structlog JSON.
+    client.run(settings.discord_bot_token, log_handler=None)
 
 
 if __name__ == "__main__":
