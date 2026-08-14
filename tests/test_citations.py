@@ -23,7 +23,10 @@ def test_rule_citation_omits_long_inline_title():
         {
             "source_type": "rule",
             "rule_id": "002",
-            "title": "卡牌文字凌駕於規則文字之上。當一張卡牌的內容與規則產生根本性的衝突時，以該卡牌上的說明為準。",
+            "title": (
+                "卡牌文字凌駕於規則文字之上。"
+                "當一張卡牌的內容與規則產生根本性的衝突時，以該卡牌上的說明為準。"
+            ),
         }
     )
     assert citation.label == "規則 002"

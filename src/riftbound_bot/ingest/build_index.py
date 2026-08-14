@@ -190,7 +190,11 @@ def build_index(settings) -> int:
     for start in range(0, len(documents), batch_size):
         batch = documents[start : start + batch_size]
         vectorstore.add_documents(batch)
-        logger.info("build_index.progress", indexed=min(start + batch_size, len(documents)), total=len(documents))
+        logger.info(
+            "build_index.progress",
+            indexed=min(start + batch_size, len(documents)),
+            total=len(documents),
+        )
 
     persist_dir = Path(settings.vector_store_dir)
     persist_dir.mkdir(parents=True, exist_ok=True)

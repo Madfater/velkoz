@@ -2,15 +2,20 @@
 name = "riftbound-bot"
 version = "0.1.0"
 description = "Traditional Chinese Riftbound rules & card-interaction Discord bot (RAG)"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "discord-py>=2.4",
-    "langchain>=0.3",
+    # langchain-core for the Document/BaseChatModel/VectorStore interfaces and
+    # langchain-openai for the clients; the `langchain` umbrella package isn't
+    # imported anywhere and would pull its whole tree into the runtime image.
+    "langchain-core>=0.3",
     "langchain-openai>=0.2",
+    # Imported directly by bot.py for RateLimitError, on the user-facing error
+    # path — too load-bearing to rely on arriving through langchain-openai.
+    "openai>=1.0",
     "turbovec[langchain]>=0.8.0",
     "python-dotenv>=1.0",
     "httpx>=0.27",
-    "beautifulsoup4>=4.12",
     "structlog>=24.0",
     "tenacity>=9.0",
     "psycopg[binary]>=3.1",
@@ -26,6 +31,8 @@ dev = [
 riftbound-bot = "riftbound_bot.bot:main"
 riftbound-build-index = "riftbound_bot.ingest.build_index:main"
 riftbound-rules-sync = "riftbound_bot.ingest.rules_sync:main"
+riftbound-cards-scrape = "riftbound_bot.ingest.cards_scrape:main"
+riftbound-cards-from-api = "riftbound_bot.ingest.cards_from_api:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -33,3 +40,21 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/riftbound_bot"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+# Beyond ruff's defaults (E4/E7/E9/F): import sorting, pyupgrade for the 3.12
+# floor, and the bugbear checks that catch real mistakes (mutable defaults,
+# except-clause ordering) rather than style opinions.
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Surface warnings from our own code rather than letting them accumulate
+# unread; third-party deprecations stay non-fatal.
+filterwarnings = [
+    "default",
+    "error::DeprecationWarning:riftbound_bot.*",
+]

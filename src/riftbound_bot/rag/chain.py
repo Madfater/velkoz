@@ -172,7 +172,10 @@ class RiftboundRagChain:
         rather than a direct "what is X" definition question.
         """
         matches = self._specific_substring_matches(self.indexes.rule_docs_by_keyword, question)
-        return [(self.indexes.rule_docs_by_keyword[name], EXACT_MATCH_SCORE) for name in matches[:MAX_EXACT_MATCH_NAMES]]
+        return [
+            (self.indexes.rule_docs_by_keyword[name], EXACT_MATCH_SCORE)
+            for name in matches[:MAX_EXACT_MATCH_NAMES]
+        ]
 
     def _symbol_expansions(self, docs: list[Document]) -> list[tuple[Document, float]]:
         """When a force-included document's own text uses a bracket shorthand
