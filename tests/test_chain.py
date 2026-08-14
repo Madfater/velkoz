@@ -1,0 +1,372 @@
+from dataclasses import dataclass
+
+from riftbound_bot.rag.chain import MAX_EXACT_MATCH_NAMES, NO_CONTEXT_REPLY, RiftboundRagChain
+
+
+@dataclass
+class FakeDoc:
+    page_content: str
+    metadata: dict
+
+
+@dataclass
+class FakeResponse:
+    content: str
+
+
+class FakeVectorstore:
+    """Keyed by source_type so tests can control each pool independently,
+    mirroring how the real Chroma filter={"source_type": ...} search works.
+    `cards` backs `.get()`, mirroring the real Chroma.get() metadata-only
+    lookup (no embedding call) that RiftboundRagChain uses to load its
+    exact-name-match index at construction time.
+    """
+
+    def __init__(
+        self,
+        by_type: dict[str, list[tuple[FakeDoc, float]]],
+        cards: list[FakeDoc] | None = None,
+        rules: list[FakeDoc] | None = None,
+    ):
+        self._by_type = by_type
+        self._cards = cards or []
+        self._rules = rules or []
+        self.calls: list[tuple[str, int, dict]] = []
+        self.get_calls: list[dict] = []
+
+    def similarity_search_with_relevance_scores(self, query, k, filter):
+        self.calls.append((query, k, filter))
+        return self._by_type.get(filter["source_type"], [])
+
+    def get(self, where, include=None):
+        self.get_calls.append(where)
+        if where.get("source_type") == "rule":
+            docs = self._rules
+        else:
+            name = where.get("name_zh")
+            docs = self._cards if name is None else [d for d in self._cards if d.metadata.get("name_zh") == name]
+        return {
+            "ids": [d.metadata.get("card_id") or d.metadata.get("rule_id") for d in docs],
+            "metadatas": [d.metadata for d in docs],
+            "documents": [d.page_content for d in docs],
+        }
+
+
+class FakeLLM:
+    def __init__(self, reply: str):
+        self.reply = reply
+        self.last_messages: list | None = None
+
+    def invoke(self, messages):
+        self.last_messages = messages
+        return FakeResponse(content=self.reply)
+
+
+def make_rule_doc(rule_id: str, text: str) -> FakeDoc:
+    return FakeDoc(page_content=text, metadata={"source_type": "rule", "rule_id": rule_id, "title": ""})
+
+
+def make_card_doc(card_id: str, name_zh: str, text: str, rarity: str = "普通") -> FakeDoc:
+    return FakeDoc(
+        page_content=text,
+        metadata={
+            "source_type": "card",
+            "card_id": card_id,
+            "name_zh": name_zh,
+            "source_url": "",
+            "rarity": rarity,
+        },
+    )
+
+
+def make_keyword_header_doc(rule_id: str, term_zh: str, term_en: str) -> FakeDoc:
+    title = f"{term_zh}（{term_en}）"
+    return FakeDoc(page_content=title, metadata={"source_type": "rule", "rule_id": rule_id, "title": title})
+
+
+def test_ask_returns_no_context_reply_when_nothing_relevant():
+    chain = RiftboundRagChain(
+        vectorstore=FakeVectorstore({}),
+        llm=FakeLLM("should not be called"),
+        pool_per_type=10,
+        k=6,
+        score_threshold=0.45,
+    )
+    result = chain.ask("什麼是疾行？")
+    assert result.answer == NO_CONTEXT_REPLY
+    assert result.citations_markdown == ""
+
+
+def test_ask_merges_rules_and_cards_pools_by_score():
+    vectorstore = FakeVectorstore(
+        {
+            "rule": [(make_rule_doc("805.1", "疾行是一種單位能力。"), 0.9)],
+            "card": [(make_card_doc("OGN-001", "測試卡", "測試卡效果文字。"), 0.6)],
+        }
+    )
+    llm = FakeLLM("疾行是……[1]")
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=llm, pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("什麼是疾行？")
+
+    assert result.answer == "疾行是……[1]"
+    labels = result.citations_markdown.splitlines()
+    assert labels[0] == "- 規則 805.1"  # higher score, comes first
+    assert "測試卡" in labels[1]
+
+
+def test_ask_filters_each_pool_by_score_threshold_independently():
+    vectorstore = FakeVectorstore(
+        {
+            "rule": [(make_rule_doc("805.1", "疾行是一種單位能力。"), 0.9)],
+            "card": [(make_card_doc("OGN-001", "不相關卡", "不相關內容"), 0.1)],
+        }
+    )
+    llm = FakeLLM("疾行是……[1]")
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=llm, pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("什麼是疾行？")
+
+    assert "規則 805.1" in result.citations_markdown
+    assert "不相關卡" not in result.citations_markdown
+
+
+def test_ask_caps_merged_pool_at_k_keeping_highest_scores():
+    # Rule scores: 0.90, 0.89, 0.88, 0.87, 0.86. Card scores: 0.80, ..., 0.76.
+    rules = [(make_rule_doc(str(i), f"規則內容 {i}"), round(0.9 - i * 0.01, 2)) for i in range(5)]
+    cards = [(make_card_doc(f"C{i}", f"卡 {i}", f"卡牌內容 {i}"), round(0.8 - i * 0.01, 2)) for i in range(5)]
+    vectorstore = FakeVectorstore({"rule": rules, "card": cards})
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM("回答"), pool_per_type=10, k=3, score_threshold=0.0
+    )
+
+    retrieved = chain._retrieve("問題")
+
+    assert [doc.metadata["rule_id"] for doc, _ in retrieved] == ["0", "1", "2"]
+    assert [score for _, score in retrieved] == [0.9, 0.89, 0.88]
+
+
+def test_ask_includes_history_and_context_in_prompt():
+    vectorstore = FakeVectorstore({"rule": [(make_rule_doc("805.1", "疾行是一種單位能力。"), 0.9)], "card": []})
+    llm = FakeLLM("回答")
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=llm, pool_per_type=10, k=6, score_threshold=0.45)
+
+    history = [("human", "先前的問題"), ("ai", "先前的回答")]
+    chain.ask("後續問題", history=history)
+
+    messages = llm.last_messages
+    assert messages[0][0] == "system"
+    assert messages[1] == ("human", "先前的問題")
+    assert messages[2] == ("ai", "先前的回答")
+    assert messages[-1][0] == "human"
+    assert "疾行是一種單位能力。" in messages[-1][1]
+    assert "後續問題" in messages[-1][1]
+
+
+def test_ask_queries_both_pools_with_pool_per_type_as_k():
+    vectorstore = FakeVectorstore({"rule": [], "card": []})
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=15, k=6, score_threshold=0.45)
+    chain.ask("問題")
+    source_types = {call[2]["source_type"] for call in vectorstore.calls}
+    assert source_types == {"rule", "card"}
+    assert all(call[1] == 15 for call in vectorstore.calls)
+
+
+def test_exact_card_name_match_is_force_included_even_below_threshold():
+    # The card never scores above threshold in similarity search (mirrors the
+    # confirmed real-world bug: an exact-name query still ranking a card
+    # outside the top of its own pool), but its name is typed verbatim in the
+    # question, so it must still surface.
+    card = make_card_doc("OGN-245", "團結之印", "團結之印（Seal of Unity）效果：橫置：反應—獲得黃色。")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[card])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("可以[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("團結之印可以支付待命的費用嗎")
+
+    assert "團結之印" in result.citations_markdown
+    assert "OGN-245" in result.citations_markdown
+
+
+def test_exact_matches_are_capped_by_k():
+    cards = [make_card_doc(f"C{i}", f"卡牌{i}號", f"卡{i}效果") for i in range(3)]
+    question = "".join(c.metadata["name_zh"] for c in cards)
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=cards)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=2, score_threshold=0.45)
+
+    retrieved = chain._retrieve(question)
+
+    assert len(retrieved) == 2
+
+
+def test_exact_matches_are_capped_at_max_exact_match_names():
+    cards = [make_card_doc(f"C{i}", f"獨特卡牌{i}號", f"卡{i}效果") for i in range(MAX_EXACT_MATCH_NAMES + 2)]
+    question = "".join(c.metadata["name_zh"] for c in cards)
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=cards)
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=20, score_threshold=0.45)
+
+    retrieved = chain._retrieve(question)
+
+    assert len(retrieved) == MAX_EXACT_MATCH_NAMES
+
+
+def test_exact_match_multi_printing_prefers_non_alt_art():
+    alt = make_card_doc("SFD-238", "團結之印", "異畫版效果文字", rarity="異畫")
+    standard = make_card_doc("OGN-245", "團結之印", "標準版效果文字", rarity="史詩")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[alt, standard])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("團結之印是什麼")
+
+    assert [doc.metadata["card_id"] for doc, _ in retrieved] == ["OGN-245"]
+
+
+def test_exact_match_drops_subsumed_shorter_name():
+    short = make_card_doc("C1", "提摩", "提摩基礎效果")
+    longer = make_card_doc("C2", "提摩-戰略家", "提摩-戰略家效果")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[short, longer])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("提摩-戰略家的效果是什麼")
+
+    assert [doc.metadata["card_id"] for doc, _ in retrieved] == ["C2"]
+
+
+def test_exact_match_dedups_against_similarity_pool_hit():
+    card = make_card_doc("OGN-245", "團結之印", "團結之印效果文字")
+    vectorstore = FakeVectorstore({"rule": [], "card": [(card, 0.9)]}, cards=[card])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("團結之印是什麼")
+
+    assert result.citations_markdown.count("團結之印") == 1
+
+
+def test_no_exact_match_leaves_score_sort_behavior_intact():
+    rules = [(make_rule_doc(str(i), f"規則內容 {i}"), round(0.9 - i * 0.01, 2)) for i in range(5)]
+    cards = [(make_card_doc(f"C{i}", f"卡 {i}", f"卡牌內容 {i}"), round(0.8 - i * 0.01, 2)) for i in range(5)]
+    vectorstore = FakeVectorstore({"rule": rules, "card": cards}, cards=[])
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM("回答"), pool_per_type=10, k=3, score_threshold=0.0
+    )
+
+    retrieved = chain._retrieve("問題")
+
+    assert [doc.metadata["rule_id"] for doc, _ in retrieved] == ["0", "1", "2"]
+    assert [score for _, score in retrieved] == [0.9, 0.89, 0.88]
+
+
+def test_exact_keyword_match_is_force_included_even_below_threshold():
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    sub_rule = make_rule_doc("811.1.b", "待命的完整效果等同於：「...你可以支付 [A]...」")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_rule])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("可以[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("團結之印可以支付待命的費用嗎")
+
+    assert "待命" in result.citations_markdown
+    assert "811" in result.citations_markdown
+
+
+def test_exact_keyword_match_combines_full_subtree_into_one_document():
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    sub_a = make_rule_doc("811.1", "待命是一種關鍵字。")
+    sub_b = make_rule_doc("811.1.b", "待命的完整效果等同於：「...你可以支付 [A]...」")
+    unrelated = make_keyword_header_doc("805", "疾行", "Accelerate")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_a, sub_b, unrelated])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("待命是什麼")
+
+    assert len(retrieved) == 1
+    doc, score = retrieved[0]
+    assert doc.metadata["rule_id"] == "811"
+    assert "待命是一種關鍵字" in doc.page_content
+    assert "可以支付 [A]" in doc.page_content
+
+
+def test_exact_keyword_match_dedups_against_similarity_pool_hit_in_subtree():
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    sub_rule = make_rule_doc("811.1.b", "待命的完整效果等同於：「...」")
+    vectorstore = FakeVectorstore(
+        {"rule": [(sub_rule, 0.9)], "card": []}, rules=[header, sub_rule]
+    )
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[1]"), pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("待命是什麼")
+
+    assert result.citations_markdown.count("待命") == 1
+
+
+def test_no_keyword_match_leaves_score_sort_behavior_intact():
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    rules = [(make_rule_doc(str(i), f"規則內容 {i}"), round(0.9 - i * 0.01, 2)) for i in range(5)]
+    vectorstore = FakeVectorstore({"rule": rules, "card": []}, rules=[header])
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM("回答"), pool_per_type=10, k=3, score_threshold=0.0
+    )
+
+    retrieved = chain._retrieve("問題")
+
+    assert [doc.metadata["rule_id"] for doc, _ in retrieved] == ["0", "1", "2"]
+
+
+def test_symbol_expansion_pulls_in_definition_referenced_by_exact_match():
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    sub_rule = make_rule_doc("811.1.b", "待命的完整效果等同於：「你可以支付 [A]...」")
+    symbol_def = make_rule_doc("135.2.e.5", "任意屬性的力量，以旋轉的彩虹符號表示，簡稱為 [A]。")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_rule, symbol_def])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案[1][2]"), pool_per_type=10, k=6, score_threshold=0.45)
+
+    result = chain.ask("待命的費用是什麼")
+
+    assert "135.2.e.5" in result.citations_markdown
+
+
+def test_symbol_expansion_combines_definition_subtree():
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    sub_rule = make_rule_doc("811.1.b", "支付 [A]")
+    symbol_def = make_rule_doc("135.2.e.5", "簡稱為 [A]。")
+    symbol_sub = make_rule_doc("135.2.e.5.a", "當費用要求 [A] 時，可以任意屬性的力量支付。")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_rule, symbol_def, symbol_sub])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("待命的費用")
+
+    matches = [doc for doc, _ in retrieved if doc.metadata.get("rule_id") == "135.2.e.5"]
+    assert len(matches) == 1
+    assert "當費用要求 [A] 時" in matches[0].page_content
+
+
+def test_symbol_expansion_skips_already_included_definition():
+    already_included = make_rule_doc("135.2.e.5", "簡稱為 [A]。支付 [A] 也在這裡。")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[already_included])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    expansions = chain._symbol_expansions([already_included])
+
+    assert expansions == []
+
+
+def test_no_symbol_in_matches_means_no_expansion():
+    header = make_keyword_header_doc("805", "疾行", "Accelerate")
+    sub_rule = make_rule_doc("805.1", "疾行是一種單位能力，不涉及任何符號。")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=[header, sub_rule])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
+
+    retrieved = chain._retrieve("疾行是什麼")
+
+    assert len(retrieved) == 1
+
+
+def test_card_and_rule_indexes_are_loaded_once_at_construction():
+    card = make_card_doc("OGN-245", "團結之印", "團結之印效果文字")
+    header = make_keyword_header_doc("811", "待命", "Hidden")
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[card], rules=[header])
+    chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM("答案"), pool_per_type=10, k=6, score_threshold=0.45)
+
+    assert vectorstore.get_calls == [{"source_type": "card"}, {"source_type": "rule"}]
+
+    chain.ask("團結之印是什麼")
+    chain.ask("另一個問題")
+
+    assert vectorstore.get_calls == [{"source_type": "card"}, {"source_type": "rule"}]
