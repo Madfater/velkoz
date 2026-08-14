@@ -40,7 +40,7 @@ class Settings:
             retrieval_pool_per_type=int(os.environ.get("RETRIEVAL_POOL_PER_TYPE", "10")),
             retrieval_k=int(os.environ.get("RETRIEVAL_K", "6")),
             retrieval_score_threshold=float(
-                os.environ.get("RETRIEVAL_SCORE_THRESHOLD", "0.45")
+                os.environ.get("RETRIEVAL_SCORE_THRESHOLD", "0.5")
             ),
             vector_store_dir=os.environ.get("VECTOR_STORE_DIR", "data/turbovec"),
         )

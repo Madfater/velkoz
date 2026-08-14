@@ -204,18 +204,20 @@ blended top-k search. The card corpus outnumbers rules ~25 to 1 and is structura
 relevant rule chunks even when the rules-only pool ranked the correct answer #1 with a clean
 score margin. See the docstring on `RiftboundRagChain` in `rag/chain.py`.
 
-`RETRIEVAL_SCORE_THRESHOLD` (default 0.45) gates each pool on embedding cosine similarity —
-it's the "nothing relevant was found" safety cutoff before the LLM is even called. Sanity-check
-this against your own embedding endpoint before trusting the default: retrieve a known-relevant
-query and a clearly off-topic one, and confirm there's an actual, reproducible score gap between
-them (not just in an isolated script — through `vectorstore.py`'s real `similarity_search_with_
-relevance_scores`, which is what the bot actually calls).
+`RETRIEVAL_SCORE_THRESHOLD` (default 0.5) gates each pool on embedding similarity — it's the
+"nothing relevant was found" cutoff that produces the no-data reply instead of an answer
+assembled from unrelated context.
 
-**This threshold was calibrated against Chroma's raw cosine similarity and needs re-checking
-after the TurboVec migration** — TurboVec's relevance score is `(raw_cosine + 1) / 2`, a
-different scale (0.45 there corresponds to a raw cosine of only ≈ −0.1, far too permissive).
-Redo the calibration above against the TurboVec-backed store before trusting the default in
-production.
+TurboVec's relevance score is `(raw_cosine + 1) / 2`, so **0.5 means a raw cosine of 0**: it
+discards results that are unrelated or actively anti-correlated, and nothing more. The previous
+default of 0.45 was a Chroma-era raw-cosine value; on TurboVec's scale it corresponds to a
+cosine of ≈ −0.1, which every result clears — so the safety cutoff never fired at all.
+
+0.5 is a floor, not a calibration. To tune it for your own embedding endpoint, run with
+`LOG_LEVEL=DEBUG` and compare the `score_min`/`score_max` the chain logs for a known-relevant
+question against a clearly off-topic one, then set the threshold between the two. That is a
+measurement through the real `vectorstore.py`/`chain.py` path, which is what the bot calls —
+not an isolated script.
 
 ## Known issue: card retrieval quality is unresolved for non-exact queries
 

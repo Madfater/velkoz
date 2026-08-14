@@ -54,5 +54,7 @@ def test_format_citations_deduplicates_and_orders():
     formatted = format_citations(metadatas)
     lines = formatted.splitlines()
     assert len(lines) == 2
-    assert lines[0] == "- 規則 805.1"
-    assert lines[1] == "- 規則 809 偏斜（Deflect）"
+    # Numbers are context positions, so the repeat at slot 2 is folded into
+    # [1] and slot 3 keeps its own number — the gap is the honest rendering.
+    assert lines[0] == "[1] 規則 805.1"
+    assert lines[1] == "[3] 規則 809 偏斜（Deflect）"

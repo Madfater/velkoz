@@ -107,7 +107,7 @@ def test_ask_merges_rules_and_cards_pools_by_score():
 
     assert result.answer == "疾行是……[1]"
     labels = result.citations_markdown.splitlines()
-    assert labels[0] == "- 規則 805.1"  # higher score, comes first
+    assert labels[0] == "[1] 規則 805.1"  # higher score, comes first
     assert "測試卡" in labels[1]
 
 
@@ -183,7 +183,11 @@ def test_exact_card_name_match_is_force_included_even_below_threshold():
     assert "OGN-245" in result.citations_markdown
 
 
-def test_exact_matches_are_capped_by_k():
+def test_exact_matches_are_kept_even_when_they_exceed_k():
+    # k bounds the similarity pool, not the exact matches: a card whose full
+    # name is in the question is a deterministic lexical fact, and dropping
+    # one to respect k would answer about some of the cards asked about.
+    # MAX_EXACT_MATCH_NAMES is what bounds this side.
     cards = [make_card_doc(f"C{i}", f"卡牌{i}號", f"卡{i}效果") for i in range(3)]
     question = "".join(c.metadata["name_zh"] for c in cards)
     vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=cards)
@@ -191,7 +195,7 @@ def test_exact_matches_are_capped_by_k():
 
     retrieved = chain._retrieve(question)
 
-    assert len(retrieved) == 2
+    assert len(retrieved) == 3
 
 
 def test_exact_matches_are_capped_at_max_exact_match_names():
@@ -206,7 +210,10 @@ def test_exact_matches_are_capped_at_max_exact_match_names():
 
 
 def test_exact_match_multi_printing_prefers_non_alt_art():
-    alt = make_card_doc("SFD-238", "團結之印", "異畫版效果文字", rarity="異畫")
+    # The alt-art printing deliberately holds the lexically *lower* card_id:
+    # with the ids the other way round the id tie-break alone produced the
+    # expected answer, so the test passed with the rarity filter deleted.
+    alt = make_card_doc("AAA-001", "團結之印", "異畫版效果文字", rarity="異畫")
     standard = make_card_doc("OGN-245", "團結之印", "標準版效果文字", rarity="史詩")
     vectorstore = FakeVectorstore({"rule": [], "card": []}, cards=[alt, standard])
     chain = RiftboundRagChain(vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.45)
@@ -366,3 +373,88 @@ def test_card_and_rule_indexes_are_loaded_once_at_construction():
     chain.ask("另一個問題")
 
     assert vectorstore.bulk_fetch_calls == [{"source_type": "card"}, {"source_type": "rule"}]
+
+
+def test_similarity_pool_keeps_slots_when_exact_matches_fill_k():
+    # 4 card names + 4 keyword sections already exceed k=6; truncating the
+    # whole merged list dropped every vector-ranked result.
+    cards = [make_card_doc(f"C{i}", f"獨特卡牌{i}號", f"卡{i}效果") for i in range(4)]
+    keywords = [make_keyword_header_doc(f"80{i}", f"關鍵字{i}", f"Keyword{i}") for i in range(4)]
+    question = "".join(c.metadata["name_zh"] for c in cards) + "".join(
+        k.page_content for k in keywords
+    )
+    pool_hit = make_rule_doc("999", "相似度命中的規則")
+    vectorstore = FakeVectorstore(
+        {"rule": [(pool_hit, 0.9)], "card": []}, cards=cards, rules=keywords
+    )
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.5
+    )
+
+    retrieved = chain._retrieve(question)
+
+    assert pool_hit in [doc for doc, _ in retrieved]
+    assert len([doc for doc, _ in retrieved if doc in cards]) == MAX_EXACT_MATCH_NAMES
+
+
+def test_symbol_expansions_are_never_evicted_by_other_exact_matches():
+    # The symbol expansion is what closes multi-hop questions, and it sat
+    # last in the merged list where truncation reached it first.
+    keyword = FakeDoc(
+        page_content="待命（Hidden）\n支付 [A] 以使用。",
+        metadata={"source_type": "rule", "rule_id": "811", "title": "待命（Hidden）"},
+    )
+    symbol_def = make_rule_doc("135", "力量簡稱為 [A]。")
+    cards = [make_card_doc(f"C{i}", f"獨特卡牌{i}號", f"卡{i}效果") for i in range(4)]
+    question = "待命（Hidden）" + "".join(c.metadata["name_zh"] for c in cards)
+    vectorstore = FakeVectorstore(
+        {"rule": [], "card": []}, cards=cards, rules=[keyword, symbol_def]
+    )
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.5
+    )
+
+    rule_ids = [doc.metadata.get("rule_id") for doc, _ in chain._retrieve(question)]
+
+    assert "135" in rule_ids
+
+
+def test_rule_subtrees_are_ordered_numerically_not_lexically():
+    # Segment-wise string comparison put 805.10 ahead of 805.2.
+    header = make_keyword_header_doc("805", "疾行", "Accelerate")
+    rules = [header] + [make_rule_doc(f"805.{n}", f"第 {n} 條") for n in (10, 2)]
+    vectorstore = FakeVectorstore({"rule": [], "card": []}, rules=rules)
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM(""), pool_per_type=10, k=6, score_threshold=0.5
+    )
+
+    combined = chain._rule_docs_by_keyword["疾行"].page_content
+
+    assert combined.index("第 2 條") < combined.index("第 10 條")
+
+
+def test_a_card_document_without_an_id_does_not_break_printing_choice():
+    # Every other metadata read uses .get(); this one raised at query time.
+    doc = FakeDoc(page_content="效果", metadata={"source_type": "card", "name_zh": "無編號卡"})
+
+    assert RiftboundRagChain._pick_printing([doc]) is doc
+
+
+def test_citation_numbers_line_up_with_the_context_block():
+    # The prompt tells the model to cite 「[1]」「[2]」 by context position, so
+    # the source list has to carry those same numbers.
+    rule = make_rule_doc("805.1", "疾行是一種單位能力。")
+    card = make_card_doc("OGN-245", "團結之印", "團結之印效果")
+    vectorstore = FakeVectorstore({"rule": [(rule, 0.9)], "card": [(card, 0.8)]})
+    llm = FakeLLM("根據 [1] 與 [2]，答案是……")
+    chain = RiftboundRagChain(
+        vectorstore=vectorstore, llm=FakeLLM("x"), pool_per_type=10, k=6, score_threshold=0.5
+    )
+    chain.llm = llm
+
+    result = chain.ask("疾行與團結之印")
+
+    context = llm.last_messages[-1][1]
+    assert "[1] 疾行是一種單位能力。" in context
+    assert result.citations_markdown.startswith("[1] 規則 805.1")
+    assert "[2] 卡牌《團結之印》" in result.citations_markdown

@@ -41,6 +41,14 @@ EXACT_MATCH_SCORE = float("inf")
 # ("我打出 X，對手有 Y") names two cards at once.
 MAX_EXACT_MATCH_NAMES = 4
 
+# Slots the similarity pool keeps even when exact matches alone fill k.
+# Exact matches are deterministic lexical facts and are never dropped, so
+# without a floor a question naming several cards and keywords could evict
+# the vector-ranked results entirely — including the symbol expansions that
+# close multi-hop questions. k is therefore a target, not a hard cap: the
+# worst case is 3 categories x MAX_EXACT_MATCH_NAMES plus this floor.
+MIN_POOL_SLOTS = 2
+
 # Upper bound for the "give me everything matching this filter" bulk-fetch
 # used at chain-construction time (see _load_card_docs_by_name /
 # _load_rule_chunks). TurboQuantVectorStore's similarity_search returns the
@@ -119,7 +127,7 @@ class RiftboundRagChain:
         llm: BaseChatModel,
         pool_per_type: int = 10,
         k: int = 6,
-        score_threshold: float = 0.45,
+        score_threshold: float = 0.5,
     ) -> None:
         self.vectorstore = vectorstore
         self.llm = llm
@@ -165,6 +173,19 @@ class RiftboundRagChain:
         )
 
     @staticmethod
+    def _rule_sort_key(rule_id: str) -> tuple:
+        """Orders dotted rule ids the way the rulebook does.
+
+        Segment-wise string comparison put 805.10 before 805.2. Segments are
+        mixed (135.2.e.5.a), so numeric ones sort as numbers and ahead of
+        alphabetic ones at the same depth.
+        """
+        return tuple(
+            (0, int(segment), "") if segment.isdigit() else (1, 0, segment)
+            for segment in rule_id.split(".")
+        )
+
+    @staticmethod
     def _combine_subtree(root_id: str, title: str, chunks: list[Document]) -> Document:
         """Combines a rule id and everything nested under it (rule_id ==
         root_id or starting with "root_id.") into one Document, sorted so
@@ -181,7 +202,7 @@ class RiftboundRagChain:
                 if doc.metadata.get("rule_id") == root_id
                 or doc.metadata.get("rule_id", "").startswith(f"{root_id}.")
             ),
-            key=lambda item: tuple(item[0].split(".")),
+            key=lambda item: RiftboundRagChain._rule_sort_key(item[0]),
         )
         return Document(
             page_content="\n".join(content for _id, content in subtree),
@@ -223,7 +244,7 @@ class RiftboundRagChain:
         """
         non_alt = [doc for doc in printings if doc.metadata.get("rarity") != "異畫"]
         pool = non_alt or printings
-        return min(pool, key=lambda doc: doc.metadata["card_id"])
+        return min(pool, key=lambda doc: doc.metadata.get("card_id", ""))
 
     @staticmethod
     def _specific_substring_matches(candidates, question: str) -> list[str]:
@@ -291,7 +312,7 @@ class RiftboundRagChain:
                 included_ids.add(definition.metadata.get("rule_id"))
         return expansions[:MAX_EXACT_MATCH_NAMES]
 
-    def _search_pool(self, question: str, source_type: str) -> list[tuple[object, float]]:
+    def _search_pool(self, question: str, source_type: str) -> list[tuple[Document, float]]:
         results = self.vectorstore.similarity_search_with_relevance_scores(
             question, k=self.pool_per_type, filter={"source_type": source_type}
         )
@@ -312,7 +333,7 @@ class RiftboundRagChain:
             return False
         return rule_id in matched_top_ids or any(rule_id.startswith(f"{top}.") for top in matched_top_ids)
 
-    def _retrieve(self, question: str) -> list[tuple[object, float]]:
+    def _retrieve(self, question: str) -> list[tuple[Document, float]]:
         exact_cards = self._exact_name_matches(question)
         exact_keywords = self._exact_keyword_matches(question)
         symbol_expansions = self._symbol_expansions([doc for doc, _ in exact_cards + exact_keywords])
@@ -329,7 +350,13 @@ class RiftboundRagChain:
         ]
         pool.sort(key=lambda item: item[1], reverse=True)
 
-        retrieved = (exact_cards + exact_keywords + symbol_expansions + pool)[: self.k]
+        # Truncate the pool rather than the concatenation: slicing the whole
+        # list to k let 3 categories of up to MAX_EXACT_MATCH_NAMES each crowd
+        # out everything behind them, so a question naming several cards could
+        # drop the symbol expansions and the similarity results entirely.
+        exact = exact_cards + exact_keywords + symbol_expansions
+        pool_slots = max(self.k - len(exact), MIN_POOL_SLOTS)
+        retrieved = exact + pool[:pool_slots]
         logger.info(
             "chain.retrieve",
             exact_card_matches=len(exact_cards),

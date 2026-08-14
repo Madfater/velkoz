@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# Longest title still treated as a heading rather than inline rule prose. Rule
+# text authored after the `[id]` marker lands in `title` too (see
+# rules_parser), and a full sentence makes a poor citation label.
+MAX_HEADING_TITLE_LENGTH = 24
+
 
 @dataclass(frozen=True)
 class Citation:
@@ -22,7 +27,7 @@ def citation_from_metadata(metadata: dict) -> Citation:
         # Only surface short, heading-like titles in the citation label — long
         # ones mean the rule's full body text was authored inline after the
         # `[id]` marker rather than on a following line, and isn't a heading.
-        short_title = title if len(title) <= 24 else ""
+        short_title = title if len(title) <= MAX_HEADING_TITLE_LENGTH else ""
         label = f"規則 {rule_id}" + (f" {short_title}" if short_title else "")
         return Citation(label=label)
     if source_type == "card":
@@ -34,13 +39,23 @@ def citation_from_metadata(metadata: dict) -> Citation:
 
 
 def format_citations(metadatas: list[dict]) -> str:
-    """De-duplicated, ordered citation list for the reply's footer/embed field."""
-    seen: set[str] = set()
+    """Numbered, de-duplicated citation list for the reply's embed field.
+
+    The numbers are the positions of the retrieved documents in the context
+    block the chain builds, which is what the system prompt tells the model
+    to cite as 「[1]」「[2]」. Rendering these as a plain bullet list meant an
+    answer saying 「根據 [3]」 pointed at nothing the reader could see.
+
+    A label repeated across context slots keeps its first number, so the list
+    can skip one (`[1]`, `[3]`) — the gap is honest: slot 2 cited the same
+    source as slot 1.
+    """
+    numbered: dict[str, int] = {}
     lines: list[str] = []
-    for metadata in metadatas:
+    for index, metadata in enumerate(metadatas, start=1):
         citation = citation_from_metadata(metadata)
-        if citation.label in seen:
+        if citation.label in numbered:
             continue
-        seen.add(citation.label)
-        lines.append(f"- {citation.as_markdown()}")
+        numbered[citation.label] = index
+        lines.append(f"[{index}] {citation.as_markdown()}")
     return "\n".join(lines)
