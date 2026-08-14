@@ -31,8 +31,7 @@ is one env var edit — see `.env.example`.
 ## Setup
 
 ```bash
-uv venv --python 3.12
-uv pip install -e ".[dev]"
+uv sync --extra dev            # creates .venv from uv.lock
 cp .env.example .env           # fill in the values below
 ```
 
@@ -42,7 +41,7 @@ Required in `.env`:
 |---|---|
 | `DISCORD_BOT_TOKEN` | [Discord Developer Portal](https://discord.com/developers/applications) → your app → Bot |
 | `DISCORD_GUILD_ID` | Your server icon → Copy Server ID (enable Developer Mode in Discord settings first) |
-| `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` | your own self-hosted embeddings server — must serve an OpenAI-compatible `/embeddings` endpoint |
+| `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` | your own self-hosted embeddings server — must serve an OpenAI-compatible `/v1/embeddings` endpoint |
 | `DATABASE_URL` | a running Postgres instance — `docker compose up -d postgres` locally, or your own; ingest-time only, the live bot never connects to it |
 
 `GENERATION_API_BASE_URL`/`GENERATION_MODEL` default to the free `opencode.ai/zen` gateway
@@ -61,7 +60,6 @@ read follow-up messages inside threads).
 
 ```
 data/rules/core_rules_zh_tw.md   # self-translated Traditional Chinese rules corpus (authoring source)
-data/cards/cards.json            # historical snapshot only — no longer read by any code path
 data/turbovec/                   # built vector index (gitignored, rebuild with build_index)
 ```
 
@@ -92,10 +90,12 @@ file:
 Rule IDs are copied straight from the official PDF's own numbering (e.g. `103.2.d.1`), so the
 translation work maps 1:1 onto the source document.
 
-`build_index.py` prepends each chunk's top-level section text (e.g. "805 疾行（Accelerate）")
-to its embedded content — short sub-rules like "805.1" are often just a few words
-("疾行是一種單位能力。") and embed almost meaninglessly without their keyword name attached,
-confirmed by checking real retrieval rankings before landing on this.
+`build_index.py` prepends a chunk's ancestor *headings* to its embedded content, walking the
+whole chain rather than only the top-level section — short sub-rules like "805.1" are often just
+a few words ("疾行是一種單位能力。") and embed almost meaninglessly without their keyword name
+attached, confirmed by checking real retrieval rankings before landing on this. Only
+heading-shaped ancestors are prepended; see the docstring on `_rule_documents_from_chunks` for
+how those are told apart from rule statements.
 
 After editing the Markdown, sync it into Postgres (upserts by `rule_id`; prunes any row whose id
 no longer appears in the freshly parsed file):
@@ -106,35 +106,41 @@ uv run riftbound-rules-sync
 
 ### Card data
 
-Card data lives in the `cards` Postgres table (~1,256 Traditional Chinese cards from
-chroniclecore.com / 符文戰場編年史), populated by:
+Card data lives in the `cards` Postgres table, populated from chroniclecore.com
+(符文戰場編年史) in Traditional Chinese — about 1,256 cards at the time of writing, though both
+sources grow with each set:
 
 ```bash
-uv run python -m riftbound_bot.ingest.cards_scrape
+uv run riftbound-cards-scrape
 ```
 
 This works by reading a single JSON payload the site's `/gallery` page embeds client-side
-(Next.js RSC data) rather than requesting all 1,256 card pages — much lighter on the site, but
+(Next.js RSC data) rather than requesting one page per card — much lighter on the site, but
 it also means it depends on that internal data shape and **will break if the site changes it**.
 If it does, fall back to the English community data source instead:
 
 ```bash
-uv run python -m riftbound_bot.ingest.cards_from_api
+uv run riftbound-cards-from-api
 ```
 
-This pulls the [Riftcodex](https://riftcodex.com) community REST API (English, no auth, all 8
-sets, ~1,131 cards after collapsing alternate-art/foil reprints) and translates it via the
-configured generation model — it costs one API call per 20 cards, using whatever `GENERATION_*`
-settings are active.
+This pulls the [Riftcodex](https://riftcodex.com) community REST API (English, no auth, all
+sets, ~1,131 cards at the time of writing after collapsing alternate-art/foil reprints) and
+translates it via the configured generation model — one API call per 20 cards, using whatever
+`GENERATION_*` settings are active. Each batch is upserted as it is translated, so an
+interrupted run keeps everything it already paid for; a re-run resumes rather than starting
+over. A batch whose translation comes back malformed or describing the wrong cards fails the
+run rather than silently writing the untranslated English into the Chinese columns.
 Both scripts upsert by card `id`, so a re-run updates existing cards in place rather than
 replacing the whole dataset.
 
 ### Build the vector index
 
 Re-run this any time the `rules`/`cards` Postgres tables change — it's a full rebuild (fixed
-snapshot, manual refresh, per the design doc; no watch/pipeline). Nothing touches
-`data/turbovec/` until the rebuild finishes successfully — a crash mid-build leaves the previous
-index completely untouched, never a partial one:
+snapshot, manual refresh, per the design doc; no watch/pipeline). Nothing is written until every
+document has been embedded, so a crash during the embedding pass leaves the previous index
+untouched. The final `dump()` itself writes the index and the docstore as two separate files, so
+a crash inside that short window can still leave the directory mismatched — rerun the build if
+one ever dies mid-write:
 
 ```bash
 uv run riftbound-build-index
@@ -158,6 +164,7 @@ any further message in that thread is treated as a follow-up with the prior Q&A 
 
 ```bash
 cp .env.example .env      # fill in the values above
+docker compose build      # local image; the deploy host pulls from GHCR instead
 docker compose up -d postgres
 docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.cards_scrape
 docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.rules_sync
@@ -169,6 +176,10 @@ The `postgres` service is only ever touched by the `ingest` profile (build_index
 scrape/sync scripts) — the `bot` service never connects to it, only the `data/turbovec/` index
 that `build_index` produces (bind-mounted via `./data`). Re-run the `ingest` steps any time the
 rules Markdown or card data changes; `bot` just needs restarting to pick up a fresh index.
+
+The container runs as uid 1000 so it can write to the bind-mounted `./data`. If your host user
+isn't uid 1000, adjust the `useradd`/`groupadd` lines in the Dockerfile or `build_index` won't
+be able to write the index.
 
 ### Deploying
 
@@ -243,11 +254,12 @@ self-hosted endpoint batches large embedding requests. Rules-only retrieval look
 in isolated testing but wasn't confirmed through that same production path before this was set
 aside.
 
-~~One concrete, unverified lead: `vectorstore.py` never sets a distance metric~~ — resolved:
-`vectorstore.py` sets `collection_configuration={"hnsw": {"space": "cosine"}}`, confirmed live
-against the real index that the collection's stored config actually uses cosine, not the
-Euclidean default. That specific lead is closed; the underlying embedding-quality gap for
-non-exact card queries is not.
+One lead is closed: the distance metric is not the cause. TurboVec computes cosine similarity
+unconditionally in the pinned release, with no `similarity=` kwarg to set (see the comment in
+`vectorstore.py`). The underlying embedding-quality gap for non-exact card queries is still
+open. Since then, card documents also embed colour/rarity/stats/tags, which gives
+attribute-shaped questions something to match on — but that is added retrievable surface, not a
+fix for the similarity ranking itself.
 
 **The same problem was independently confirmed for rule keyword sections** on multi-hop
 interaction questions (e.g. "團結之印可以支付待命的費用嗎") — a keyword's decisive sub-rule can
@@ -287,6 +299,3 @@ generation time.)
 - The rules corpus needs the rest of the Core Rules PDF transcribed (see above).
 - Rule 809.1.c.1's worked example says "一張渾沌（Fury）法術" — 渾沌 means Chaos, not Fury (Fury is
   狂怒, per the rune cards' data). Pre-existing typo, not touched by this pass.
-- `data/cards/cards.json` is kept as a historical snapshot of the original scrape but is no
-  longer read by any code path — safe to delete once you're comfortable relying on Postgres
-  (`cards_scrape.py`/`cards_from_api.py`) as the source of truth instead.

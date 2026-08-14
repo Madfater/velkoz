@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from riftbound_bot.ingest.rules_parser import parse_rules_text
 
 
@@ -63,12 +65,16 @@ def test_title_only_rule_has_empty_body():
     assert chunks[0].text == "遊戲概念"
 
 
-def test_real_sample_corpus_parses(tmp_path):
-    from pathlib import Path
+def test_real_sample_corpus_parses():
+    # Resolved from this file, not the working directory: a relative path made
+    # the test pass or fail depending on where pytest was invoked from.
+    corpus_path = Path(__file__).resolve().parent.parent / "data/rules/core_rules_zh_tw.md"
+    chunks = parse_rules_text(corpus_path.read_text(encoding="utf-8"))
 
-    corpus = Path("data/rules/core_rules_zh_tw.md").read_text(encoding="utf-8")
-    chunks = parse_rules_text(corpus)
     ids = {c.rule_id for c in chunks}
-    assert "805.1.a" in ids
-    assert "809.1.c.1" in ids
-    assert len(chunks) > 20
+    assert {"805", "805.1", "805.1.a", "809", "809.1.c.1"} <= ids
+    # Every chunk is citable and carries text worth embedding.
+    assert all(c.rule_id and c.text for c in chunks)
+    # A loose ">20" wouldn't notice half the corpus disappearing; the sample
+    # slice holds 94 rules, so this only needs updating when it is extended.
+    assert len(chunks) >= 90
