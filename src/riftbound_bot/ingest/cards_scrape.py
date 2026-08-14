@@ -7,7 +7,7 @@ request per card — so this fetches a single page instead of ~1,256.
 
 No official API or bulk export exists for this site (per the design doc);
 this relies on that embedded data structure and will break if the site's
-internal schema changes. If it does, use `cards_from_gist.py` instead.
+internal schema changes. If it does, use `cards_from_api.py` instead.
 """
 from __future__ import annotations
 
@@ -143,7 +143,7 @@ def _extract_card_dicts(html: str) -> list[dict]:
     raise RuntimeError(
         "Could not locate the card data array in the gallery page's RSC "
         "payload — the site's internal structure may have changed. "
-        "Fall back to cards_from_gist.py."
+        "Fall back to cards_from_api.py."
     )
 
 
