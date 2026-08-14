@@ -8,7 +8,7 @@ import structlog
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from riftbound_bot.rag.citations import format_citations
+from riftbound_bot.rag.citations import citation_marker, format_citations
 from riftbound_bot.rag.vectorstore import RetrievalStore
 
 logger = structlog.get_logger("riftbound_bot.chain")
@@ -57,8 +57,9 @@ SYSTEM_PROMPT = """\
 6. 檢索內容中的方括號符號（例如 [A]、[C]、[R]、[1]）是遊戲本身的費用與屬性符號，
    屬於規則原文的一部分，不是來源編號。來源編號一律寫成「[來源N]」。
 7. 回答中第一次出現的遊戲符號或遊戲術語，都必須讓玩家看得懂：
-   a. 若檢索內容有定義該符號或術語，就在後面用括號附上簡短說明，例如
-      「[A]（任意屬性的力量）」；同一個符號或術語之後再次出現時不用重複說明。
+   a. 若檢索內容有定義該符號或術語，就在後面用括號附上簡短說明，格式為
+      「該符號（檢索內容中對它的定義）」；說明必須逐字取自檢索內容，不可自行改寫或補充。
+      同一個符號或術語之後再次出現時不用重複說明。
    b. 若檢索內容只是提到該術語、但沒有定義它（例如「英雄區域」只出現在其他規則的引文中），
       就在後面標註「（檢索內容未收錄此術語的定義）」，不要自行補充或猜測它的意思。
 """
@@ -189,7 +190,7 @@ class RiftboundRagChain:
         (symbol definitions are usually mid-sentence); otherwise the whole
         title must match (keyword headers are exactly "term（gloss）", no
         more, no less — a `search` here would false-positive on inline
-        parentheticals like rule 103.1's "一張冠軍傳奇（Champion Legend）").
+        parentheticals like rule 103.1's "一張英雄傳奇（Champion Legend）").
         """
         by_key: dict[str, Document] = {}
         for doc in chunks:
@@ -310,6 +311,19 @@ class RiftboundRagChain:
             return False
         return rule_id in matched_top_ids or any(rule_id.startswith(f"{top}.") for top in matched_top_ids)
 
+    @classmethod
+    def _without_rule_subtrees(cls, pool: list[tuple], matched_top_ids: set[str]) -> list[tuple]:
+        """Drops pool entries already covered by a force-included subtree.
+        _combine_subtree folds a rule and everything under it into one
+        document, so leaving the individual chunk in would repeat that text
+        in the prompt and burn a second slot on it.
+        """
+        return [
+            item
+            for item in pool
+            if not cls._in_matched_rule_subtree(item[0].metadata.get("rule_id"), matched_top_ids)
+        ]
+
     def _retrieve(self, question: str) -> list[tuple[object, float]]:
         exact_cards = self._exact_name_matches(question)
         exact_keywords = self._exact_keyword_matches(question)
@@ -318,12 +332,8 @@ class RiftboundRagChain:
         exact_rule_ids = {doc.metadata.get("rule_id") for doc, _ in exact_keywords}
 
         pool = self._search_pool(question, "rule") + self._search_pool(question, "card")
-        pool = [
-            item
-            for item in pool
-            if item[0].metadata.get("card_id") not in exact_card_ids
-            and not self._in_matched_rule_subtree(item[0].metadata.get("rule_id"), exact_rule_ids)
-        ]
+        pool = [item for item in pool if item[0].metadata.get("card_id") not in exact_card_ids]
+        pool = self._without_rule_subtrees(pool, exact_rule_ids)
         pool.sort(key=lambda item: item[1], reverse=True)
 
         # Expand over the documents that would actually have reached the
@@ -334,11 +344,7 @@ class RiftboundRagChain:
         candidates = (exact_cards + exact_keywords + pool)[: self.k]
         symbol_expansions = self._symbol_expansions([doc for doc, _ in candidates])
         expansion_ids = {doc.metadata.get("rule_id") for doc, _ in symbol_expansions}
-        pool = [
-            item
-            for item in pool
-            if not self._in_matched_rule_subtree(item[0].metadata.get("rule_id"), expansion_ids)
-        ]
+        pool = self._without_rule_subtrees(pool, expansion_ids)
 
         retrieved = (exact_cards + exact_keywords + symbol_expansions + pool)[: self.k]
         logger.info(
@@ -359,14 +365,9 @@ class RiftboundRagChain:
             logger.info("chain.ask.no_context", retrieve_seconds=round(retrieve_seconds, 3))
             return RagResult(answer=NO_CONTEXT_REPLY, citations_markdown="")
 
-        # "[來源N]", not a bare "[N]": the rules corpus writes generic energy
-        # costs as bracketed digits too (805.1.a's "[1][C]"), so a bare "[1]"
-        # prefix here is indistinguishable from a cost inside the very text
-        # it labels — for the model reading this block and for the player
-        # reading the answer built from it. format_citations() numbers the
-        # footer with the same markers.
         context_block = "\n\n".join(
-            f"[來源{i + 1}] {doc.page_content}" for i, (doc, _score) in enumerate(retrieved)
+            f"{citation_marker(i + 1)} {doc.page_content}"
+            for i, (doc, _score) in enumerate(retrieved)
         )
         messages: list[tuple[str, str]] = [("system", SYSTEM_PROMPT)]
         messages.extend(history or [])

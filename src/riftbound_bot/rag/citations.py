@@ -3,6 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+def citation_marker(index: int) -> str:
+    """The token an answer cites source `index` by.
+
+    Deliberately not a bare "[N]": the rules corpus writes generic energy
+    costs as bracketed digits too (805.1.a's "額外支付 [1][C]"), so a bare
+    marker is indistinguishable from a cost inside the very text it labels.
+
+    The chain prefixes each context-block chunk with this, the answer cites
+    it, and format_citations numbers the footer with it — one definition so
+    the three can't drift apart.
+    """
+    return f"[來源{index}]"
+
+
 @dataclass(frozen=True)
 class Citation:
     label: str
@@ -48,13 +62,11 @@ def format_citations(metadatas: list[dict]) -> str:
     ("[來源2][來源5] 規則 805.1") rather than only the first: the model saw
     both slots in its context and may cite either one.
     """
-    markers_by_label: dict[str, list[int]] = {}
-    citations: dict[str, Citation] = {}
+    entries: dict[str, tuple[Citation, list[int]]] = {}
     for index, metadata in enumerate(metadatas, start=1):
         citation = citation_from_metadata(metadata)
-        markers_by_label.setdefault(citation.label, []).append(index)
-        citations.setdefault(citation.label, citation)
+        entries.setdefault(citation.label, (citation, []))[1].append(index)
     return "\n".join(
-        "".join(f"[來源{index}]" for index in markers) + f" {citations[label].as_markdown()}"
-        for label, markers in markers_by_label.items()
+        "".join(citation_marker(index) for index in indices) + f" {citation.as_markdown()}"
+        for citation, indices in entries.values()
     )

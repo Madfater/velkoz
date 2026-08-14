@@ -62,7 +62,8 @@ Three places agree on this format and have to move together: `SYSTEM_PROMPT`
 rule 2, the context-block prefix in `ask()`, and `format_citations`.
 
 Bare `[N]` was ambiguous, not merely ugly. The rules corpus writes generic energy
-costs as bracketed digits — 805.1.a and 135.2.e.6.c both contain `費用為 [1][C]` —
+costs as bracketed digits — 805.1.a has `額外支付 [1][C]`, 135.2.e.6.c has
+`費用為 [1][C]` —
 so a `[1]` in an answer could equally mean "source 1" or "1 generic energy", and
 the same collision hit the model reading its own context block. Domain symbols
 (`[A]`, `[C]`) had the same problem one letter over.
@@ -101,7 +102,19 @@ their card and matches nothing.
 This has bitten once already: the seed rendered *Champion* as 冠軍 (冠軍區,
 冠軍傳奇) while all 1,256 cards use 英雄 (`英雄單位` as a card type, `英雄區域` in
 card text) and never once say 冠軍. A question phrased with 英雄區域 could not
-reach rule 811.1.b at all. Fixed by correcting the seed.
+reach rule 811.1.b at all.
+
+The seed is corrected, which is enough for a **fresh** environment. It is not
+enough for one that has already bootstrapped: the `rules` table is the source of
+truth and the seed is never re-applied over stored rows (see
+[data-pipeline.md](data-pipeline.md)), so an existing deployment keeps serving
+冠軍 until someone runs the round trip and rebuilds the index:
+
+```bash
+uv run riftbound-rules-export -o rules.md   # then apply 冠軍 → 英雄
+uv run riftbound-rules-import rules.md
+uv run python -m riftbound_bot.ingest.build_index
+```
 
 **A known live instance of the same class:** Might is `[M]` in the rules, bare `S`
 in scraped card text (327 occurrences), and `戰力` in `cards_from_api.py`'s
