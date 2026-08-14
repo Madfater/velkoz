@@ -6,8 +6,19 @@ resolution. See [`riftbound-bot-design.md`](riftbound-bot-design.md) for the ful
 ## Stack
 
 Python + `discord.py` + LangChain, with both generation and embeddings going through
-`langchain-openai` pointed at OpenAI-compatible endpoints (rather than a single fixed provider)
-plus `langchain-chroma` for local vector storage.
+`langchain-openai` pointed at OpenAI-compatible endpoints (rather than a single fixed provider),
+[TurboVec](https://github.com/RyanCodrai/turbovec) (`turbovec[langchain]`, `TurboQuantVectorStore`)
+for local vector storage, and PostgreSQL (JSONB-backed) as the source of truth for card/rule data
+feeding the index build — see [Data pipeline](#data-pipeline) below. Logging goes through
+`structlog`; the ingest scripts' HTTP calls retry via `tenacity`.
+
+**Why TurboVec, not Chroma**: an embedded, quantized vector index rather than a full vector
+database server — no separate container to run, same "local file, no network service" shape
+Chroma had. **Why Postgres, not MongoDB** (the original plan): MongoDB 5.0+ requires a CPU with
+AVX support, which this project's target deployment hardware (an Intel Celeron J4105 / Goldmont
+Plus, no AVX) doesn't have — `mongod` would crash on startup. Postgres has no such constraint and
+gets the same flexible, per-record-upsert JSONB storage via one narrow-plus-JSONB table per
+corpus (see `ingest/db.py`).
 
 **This deviates from the design doc's original choice of Claude for generation.** The doc
 picked Claude specifically over DeepSeek for grounding/hallucination reasons — DeepSeek's
@@ -32,6 +43,7 @@ Required in `.env`:
 | `DISCORD_BOT_TOKEN` | [Discord Developer Portal](https://discord.com/developers/applications) → your app → Bot |
 | `DISCORD_GUILD_ID` | Your server icon → Copy Server ID (enable Developer Mode in Discord settings first) |
 | `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` | your own self-hosted embeddings server — must serve an OpenAI-compatible `/embeddings` endpoint |
+| `DATABASE_URL` | a running Postgres instance — `docker compose up -d postgres` locally, or your own; ingest-time only, the live bot never connects to it |
 
 `GENERATION_API_BASE_URL`/`GENERATION_MODEL` default to the free `opencode.ai/zen` gateway
 (`deepseek-v4-flash-free`) — no key needed, `GENERATION_API_KEY` can stay blank. The same
@@ -48,10 +60,17 @@ read follow-up messages inside threads).
 ## Data pipeline
 
 ```
-data/rules/core_rules_zh_tw.md   # self-translated Traditional Chinese rules corpus
-data/cards/cards.json            # normalized card data
-data/chroma/                     # built vector index (gitignored, rebuild with build_index)
+data/rules/core_rules_zh_tw.md   # self-translated Traditional Chinese rules corpus (authoring source)
+data/cards/cards.json            # historical snapshot only — no longer read by any code path
+data/turbovec/                   # built vector index (gitignored, rebuild with build_index)
 ```
+
+Postgres (`cards`/`rules` tables, JSONB-backed — see `ingest/db.py`) sits between the raw sources
+above and the vector index: `cards_scrape.py`/`cards_from_gist.py` upsert scraped cards directly
+into the `cards` table (per-record, not a whole-file replace), `rules_sync.py` parses
+`data/rules/*.md` and upserts into the `rules` table, and `build_index.py` reads both tables to
+build the vector store. This is all ingest-time — the live bot only ever reads the already-built
+`data/turbovec/` index, never Postgres directly (see `rag/vectorstore.py`'s `load_vectorstore`).
 
 ### Rules corpus
 
@@ -78,13 +97,20 @@ to its embedded content — short sub-rules like "805.1" are often just a few wo
 ("疾行是一種單位能力。") and embed almost meaninglessly without their keyword name attached,
 confirmed by checking real retrieval rankings before landing on this.
 
-### Card data
-
-`data/cards/cards.json` is **already the complete dataset** — all 1,256 Traditional Chinese
-cards from chroniclecore.com (符文戰場編年史), scraped via:
+After editing the Markdown, sync it into Postgres (upserts by `rule_id`; prunes any row whose id
+no longer appears in the freshly parsed file):
 
 ```bash
-uv run python -m riftbound_bot.ingest.cards_scrape data/cards/cards.json
+uv run riftbound-rules-sync
+```
+
+### Card data
+
+Card data lives in the `cards` Postgres table (~1,256 Traditional Chinese cards from
+chroniclecore.com / 符文戰場編年史), populated by:
+
+```bash
+uv run python -m riftbound_bot.ingest.cards_scrape
 ```
 
 This works by reading a single JSON payload the site's `/gallery` page embeds client-side
@@ -93,16 +119,20 @@ it also means it depends on that internal data shape and **will break if the sit
 If it does, fall back to the English community data source instead:
 
 ```bash
-uv run python -m riftbound_bot.ingest.cards_from_gist data/cards/cards.json
+uv run python -m riftbound_bot.ingest.cards_from_gist
 ```
 
 This pulls OwenMelbz's community card-data gist and translates it via the configured generation
 model — it costs one API call per 20 cards, using whatever `GENERATION_*` settings are active.
+Both scripts upsert by card `id`, so a re-run updates existing cards in place rather than
+replacing the whole dataset.
 
 ### Build the vector index
 
-Re-run this any time `data/rules/` or `data/cards/cards.json` changes — it's a full rebuild
-(fixed snapshot, manual refresh, per the design doc; no watch/pipeline):
+Re-run this any time the `rules`/`cards` Postgres tables change — it's a full rebuild (fixed
+snapshot, manual refresh, per the design doc; no watch/pipeline). Nothing touches
+`data/turbovec/` until the rebuild finishes successfully — a crash mid-build leaves the previous
+index completely untouched, never a partial one:
 
 ```bash
 uv run riftbound-build-index
@@ -116,6 +146,29 @@ uv run riftbound-bot
 
 Use `/ask` in your Discord server. The bot replies and spawns a thread from its own reply —
 any further message in that thread is treated as a follow-up with the prior Q&A as context.
+
+## Running with Docker
+
+```bash
+cp .env.example .env      # fill in the values above
+docker compose up -d postgres
+docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.cards_scrape
+docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.rules_sync
+docker compose --profile tools run --rm ingest python -m riftbound_bot.ingest.build_index
+docker compose up -d bot
+```
+
+The `postgres` service is only ever touched by the `ingest` profile (build_index and the
+scrape/sync scripts) — the `bot` service never connects to it, only the `data/turbovec/` index
+that `build_index` produces (bind-mounted via `./data`). Re-run the `ingest` steps any time the
+rules Markdown or card data changes; `bot` just needs restarting to pick up a fresh index.
+
+### Deploying
+
+CI builds and pushes the image to GHCR on every push to `main`, then triggers a redeploy via a
+webhook — see `.github/workflows/ci-cd.yml`. Configure `ARCANE_WEBHOOK_URL` (or whatever your
+deploy webhook is) as a GitHub Actions secret; see that workflow file's comments for the
+operational details (pull policy, package visibility, rollback).
 
 ## Tests
 
@@ -143,6 +196,12 @@ this against your own embedding endpoint before trusting the default: retrieve a
 query and a clearly off-topic one, and confirm there's an actual, reproducible score gap between
 them (not just in an isolated script — through `vectorstore.py`'s real `similarity_search_with_
 relevance_scores`, which is what the bot actually calls).
+
+**This threshold was calibrated against Chroma's raw cosine similarity and needs re-checking
+after the TurboVec migration** — TurboVec's relevance score is `(raw_cosine + 1) / 2`, a
+different scale (0.45 there corresponds to a raw cosine of only ≈ −0.1, far too permissive).
+Redo the calibration above against the TurboVec-backed store before trusting the default in
+production.
 
 ## Known issue: card retrieval quality is unresolved for non-exact queries
 
@@ -202,8 +261,11 @@ generation time.)
 
 ## Known follow-ups
 
-- `data/cards/cards.json`'s top-level `tags` field (champion/region tags) comes from the source
-  site un-localized — some entries are Simplified rather than Traditional Chinese.
+- Card data's top-level `tags` field (champion/region tags) comes from the source site
+  un-localized — some entries are Simplified rather than Traditional Chinese.
 - The rules corpus needs the rest of the Core Rules PDF transcribed (see above).
 - Rule 809.1.c.1's worked example says "一張渾沌（Fury）法術" — 渾沌 means Chaos, not Fury (Fury is
-  狂怒, per `data/cards/cards.json`'s rune cards). Pre-existing typo, not touched by this pass.
+  狂怒, per the rune cards' data). Pre-existing typo, not touched by this pass.
+- `data/cards/cards.json` is kept as a historical snapshot of the original scrape but is no
+  longer read by any code path — safe to delete once you're comfortable relying on Postgres
+  (`cards_scrape.py`/`cards_from_gist.py`) as the source of truth instead.
