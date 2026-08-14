@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
 import structlog
 
 from riftbound_bot.ingest.http import REQUEST_HEADERS, retrying_request
+from riftbound_bot.ingest.models import CardRecord
 
 logger = structlog.get_logger("riftbound_bot.cards_scrape")
 
@@ -34,24 +34,6 @@ CARD_URL_TEMPLATE = "https://riftbound.chroniclecore.com/cards/{card_id}"
 _PUSH_RE = re.compile(r"self\.__next_f\.push\(\[1,(\".*?\")\]\)", re.DOTALL)
 _SEGMENT_RE = re.compile(r"\n(?=[0-9a-f]+:)")
 _KEYWORD_MARKUP_RE = re.compile(r"\{\{(.*?)\}\}")
-
-
-@dataclass(frozen=True)
-class CardRecord:
-    id: str
-    set: str
-    collector_number: str
-    name_zh: str
-    name_en: str
-    category: str
-    color: str
-    energy: int | None
-    power: int | None
-    might: int | None
-    rarity: str
-    tags: list[str]
-    rules_text_zh: str
-    source_url: str
 
 
 def _clean_effect_text(raw: str) -> str:
@@ -168,17 +150,16 @@ def scrape_all_cards() -> list[CardRecord]:
 
 
 def main() -> None:
-    from riftbound_bot.config import Settings
-    from riftbound_bot.ingest.db import get_connection, upsert_cards
+    from riftbound_bot.config import load_ingest_settings
+    from riftbound_bot.ingest.db import get_connection, upsert_card_records
     from riftbound_bot.logging_config import configure_logging
 
     configure_logging()
-    settings = Settings.load_for_ingest()
+    settings = load_ingest_settings()
     cards = scrape_all_cards()
-    records = [card.__dict__ for card in cards]
     with get_connection(settings) as conn:
-        upsert_cards(conn, records)
-    print(f"Upserted {len(records)} cards into Postgres.")
+        upserted = upsert_card_records(conn, cards)
+    logger.info("cards_scrape.done", upserted=upserted)
 
 
 if __name__ == "__main__":

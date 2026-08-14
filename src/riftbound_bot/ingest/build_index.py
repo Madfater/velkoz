@@ -13,7 +13,7 @@ from pathlib import Path
 import structlog
 from langchain_core.documents import Document
 
-from riftbound_bot.config import Settings
+from riftbound_bot.config import load_ingest_settings
 from riftbound_bot.ingest.db import CARDS_TABLE, RULES_TABLE, get_connection
 from riftbound_bot.ingest.rules_parser import RuleChunk
 from riftbound_bot.logging_config import configure_logging
@@ -200,7 +200,7 @@ def build_index(settings) -> int:
 
 def main() -> None:
     configure_logging()
-    settings = Settings.load_for_ingest()
+    settings = load_ingest_settings()
     count = build_index(settings)
     logger.info("build_index.done", indexed=count, persist_dir=settings.vector_store_dir)
 

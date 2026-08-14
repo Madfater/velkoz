@@ -14,7 +14,7 @@ from __future__ import annotations
 import structlog
 from psycopg.types.json import Jsonb
 
-from riftbound_bot.config import Settings
+from riftbound_bot.config import load_ingest_settings
 from riftbound_bot.ingest.db import RULES_TABLE, get_connection
 from riftbound_bot.ingest.rules_parser import parse_rules_dir
 from riftbound_bot.logging_config import configure_logging
@@ -67,9 +67,8 @@ def sync_rules(settings) -> int:
 
 def main() -> None:
     configure_logging()
-    settings = Settings.load_for_ingest()
-    count = sync_rules(settings)
-    print(f"Done. Synced {count} rule chunks into Postgres.")
+    settings = load_ingest_settings()
+    sync_rules(settings)
 
 
 if __name__ == "__main__":

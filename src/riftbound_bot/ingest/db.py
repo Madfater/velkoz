@@ -11,10 +11,13 @@ scraped fields into rigid typed columns.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import psycopg
 from psycopg.types.json import Jsonb
 
 from riftbound_bot.config import IngestSettings
+from riftbound_bot.ingest.models import CardRecord
 
 CARDS_TABLE = "cards"
 RULES_TABLE = "rules"
@@ -67,3 +70,10 @@ def upsert_cards(conn: psycopg.Connection, cards: list[dict]) -> None:
     of only ever replacing the whole dataset (the old cards.json behavior)."""
     with conn.cursor() as cur:
         cur.executemany(_UPSERT_CARD_SQL, [(card["id"], Jsonb(card)) for card in cards])
+
+
+def upsert_card_records(conn: psycopg.Connection, records: Iterable[CardRecord]) -> int:
+    """upsert_cards for the dataclass both card sources produce."""
+    rows = [record.as_row() for record in records]
+    upsert_cards(conn, rows)
+    return len(rows)

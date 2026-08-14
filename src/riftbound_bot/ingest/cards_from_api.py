@@ -27,15 +27,14 @@ import html
 import json
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 import structlog
 from langchain_core.language_models.chat_models import BaseChatModel
 
-from riftbound_bot.ingest.cards_scrape import CardRecord
 from riftbound_bot.ingest.http import REQUEST_HEADERS, retrying_request
+from riftbound_bot.ingest.models import ApiCard, CardRecord
 from riftbound_bot.rag.llm import build_chat_model
 
 logger = structlog.get_logger("riftbound_bot.cards_from_api")
@@ -176,22 +175,6 @@ any rune -> 任意符文、Exhaust -> 橫置。
 輸出必須是「同樣長度、同樣順序」的 JSON 陣列，每個元素是
 {"id": "...", "name_zh": "...", "text_zh": "..."}，不要添加任何其他文字或說明。
 """
-
-
-@dataclass(frozen=True)
-class ApiCard:
-    id: str
-    name_en: str
-    text_en: str
-    set: str
-    collector_number: str
-    category: str
-    color: str
-    rarity: str
-    energy: int | None
-    power: int | None
-    might: int | None
-    tags: list[str] = field(default_factory=list)
 
 
 def _expand_icons(text: str) -> str:
@@ -455,25 +438,6 @@ def _translate_batch(llm: BaseChatModel, batch: list[ApiCard]) -> dict[str, tupl
     raise AssertionError("unreachable")
 
 
-def _to_record(card: ApiCard, name_zh: str, text_zh: str) -> CardRecord:
-    return CardRecord(
-        id=card.id,
-        set=card.set,
-        collector_number=card.collector_number,
-        name_zh=name_zh,
-        name_en=card.name_en,
-        category=card.category,
-        color=card.color,
-        energy=card.energy,
-        power=card.power,
-        might=card.might,
-        rarity=card.rarity,
-        tags=card.tags,
-        rules_text_zh=text_zh,
-        source_url=CARD_URL_TEMPLATE.format(card_id=card.id),
-    )
-
-
 def translate_batches(
     cards: list[ApiCard], base_url: str, api_key: str, model: str
 ) -> Iterator[list[CardRecord]]:
@@ -489,17 +453,22 @@ def translate_batches(
         batch = cards[start : start + BATCH_SIZE]
         translations = _translate_batch(llm, batch)
         logger.info("cards_from_api.translated_batch", batch=index, of=total_batches, cards=len(batch))
-        yield [_to_record(card, *translations[card.id]) for card in batch]
+        yield [
+            card.to_record(
+                *translations[card.id], source_url=CARD_URL_TEMPLATE.format(card_id=card.id)
+            )
+            for card in batch
+        ]
 
 
 def main() -> None:
-    from riftbound_bot.config import Settings
-    from riftbound_bot.ingest.db import get_connection, upsert_cards
+    from riftbound_bot.config import Settings, load_ingest_settings
+    from riftbound_bot.ingest.db import get_connection, upsert_card_records
     from riftbound_bot.logging_config import configure_logging
 
     configure_logging()
     generation_settings = Settings.load_generation()
-    ingest_settings = Settings.load_for_ingest()
+    ingest_settings = load_ingest_settings()
     cards = fetch_api_cards()
 
     # Upsert each batch as it lands rather than after the whole translation:
@@ -512,9 +481,8 @@ def main() -> None:
             api_key=generation_settings.generation_api_key,
             model=generation_settings.generation_model,
         ):
-            upsert_cards(conn, [r.__dict__ for r in records])
-            upserted += len(records)
-    print(f"Upserted {upserted} translated cards into Postgres.")
+            upserted += upsert_card_records(conn, records)
+    logger.info("cards_from_api.done", upserted=upserted)
 
 
 if __name__ == "__main__":
