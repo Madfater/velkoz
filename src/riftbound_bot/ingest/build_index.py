@@ -1,5 +1,5 @@
-"""CLI: (re)builds the TurboVec vector store from the `rules` and `cards`
-Postgres tables (populated by rules_sync.py / cards_scrape.py /
+"""CLI: (re)builds the `embeddings` pgvector table from the `rules` and `cards`
+Postgres tables (populated by rules_import.py / cards_scrape.py /
 cards_from_api.py). Manual, re-runnable refresh — no ingestion pipeline or
 watch process, matching the design doc's "fixed snapshot" data model.
 
@@ -8,16 +8,23 @@ Usage:
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import structlog
 from langchain_core.documents import Document
+from psycopg.types.json import Jsonb
 
 from riftbound_bot.config import Settings
-from riftbound_bot.ingest.db import CARDS_TABLE, RULES_TABLE, get_connection
+from riftbound_bot.ingest.db import (
+    CARDS_TABLE,
+    EMBEDDINGS_BUILD_TABLE,
+    RULES_TABLE,
+    create_embeddings_build_table,
+    embedding_dimension,
+    get_connection,
+    promote_embeddings_build_table,
+)
 from riftbound_bot.ingest.rules_parser import RuleChunk
 from riftbound_bot.logging_config import configure_logging
-from riftbound_bot.rag.vectorstore import build_embeddings, create_vectorstore
+from riftbound_bot.rag.vectorstore import build_embeddings, to_vector_literal
 
 logger = structlog.get_logger("riftbound_bot.build_index")
 
@@ -60,7 +67,7 @@ def _rule_documents(conn) -> list[Document]:
         cur.execute(f"SELECT data FROM {RULES_TABLE}")
         chunks = [RuleChunk(**row[0]) for row in cur.fetchall()]
     if not chunks:
-        print("No rule data in Postgres — skipping rules (run rules_sync.py first).")
+        print("No rule data in Postgres — skipping rules (run rules_import.py first).")
     by_id = {chunk.rule_id: chunk for chunk in chunks}
     sentence_end = ("。", "！", "？")
 
@@ -127,34 +134,82 @@ def _card_documents(conn) -> list[Document]:
     return documents
 
 
+def _document_id(document: Document) -> str:
+    """Stable primary key, so a row always maps back to the record it came from.
+
+    Rules and cards each have their own id space, hence the source_type prefix
+    — without it a rule numbered like a card id could collide.
+    """
+    metadata = document.metadata
+    natural_id = metadata.get("rule_id") or metadata.get("card_id")
+    return f"{metadata['source_type']}:{natural_id}"
+
+
+_INSERT_SQL = f"""
+INSERT INTO {EMBEDDINGS_BUILD_TABLE} (id, source_type, data, embedding)
+VALUES (%s, %s, %s, %s::vector)
+ON CONFLICT (id) DO UPDATE SET
+    source_type = EXCLUDED.source_type,
+    data = EXCLUDED.data,
+    embedding = EXCLUDED.embedding
+"""
+
+
 def build_index(settings) -> int:
     with get_connection(settings) as conn:
         documents = _rule_documents(conn) + _card_documents(conn)
-    if not documents:
-        raise RuntimeError(
-            "No documents found to index — run rules_sync.py / cards_scrape.py first."
+        if not documents:
+            raise RuntimeError(
+                "No documents found to index — run rules_import.py / cards_scrape.py first."
+            )
+
+        embeddings = build_embeddings(
+            base_url=settings.embedding_base_url,
+            api_key=settings.embedding_api_key,
+            model=settings.embedding_model,
         )
 
-    embeddings = build_embeddings(
-        base_url=settings.embedding_base_url,
-        api_key=settings.embedding_api_key,
-        model=settings.embedding_model,
-    )
-    vectorstore = create_vectorstore(embeddings)
-    # Embed in batches so progress is visible on a full rebuild. Nothing
-    # touches disk until the final dump() below — a crash mid-loop leaves
-    # whatever was already persisted at persist_dir completely untouched,
-    # unlike Chroma's old auto-persist-per-write behavior which could leave
-    # the bot silently serving a partial index after a crash.
-    batch_size = 100
-    for start in range(0, len(documents), batch_size):
-        batch = documents[start : start + batch_size]
-        vectorstore.add_documents(batch)
-        logger.info("build_index.progress", indexed=min(start + batch_size, len(documents)), total=len(documents))
+        # Embed in batches so progress is visible on a full rebuild. Everything
+        # lands in the build table; the live `embeddings` table is only touched
+        # by the promote below, so a crash mid-loop leaves the bot serving the
+        # previous index rather than a partial one.
+        batch_size = 100
+        dim: int | None = None
+        for start in range(0, len(documents), batch_size):
+            batch = documents[start : start + batch_size]
+            vectors = embeddings.embed_documents([doc.page_content for doc in batch])
 
-    persist_dir = Path(settings.vector_store_dir)
-    persist_dir.mkdir(parents=True, exist_ok=True)
-    vectorstore.dump(str(persist_dir))
+            if dim is None:
+                # The endpoint is the only authority on vector width — nothing
+                # configures it — so the table is sized from the first batch
+                # actually returned rather than from a setting that could drift
+                # out of step with the deployed embedding model.
+                dim = len(vectors[0])
+                previous = embedding_dimension(conn)
+                if previous is not None and previous != dim:
+                    logger.info("build_index.dimension_changed", previous=previous, current=dim)
+                create_embeddings_build_table(conn, dim)
+
+            with conn.cursor() as cur:
+                cur.executemany(
+                    _INSERT_SQL,
+                    [
+                        (
+                            _document_id(doc),
+                            doc.metadata["source_type"],
+                            Jsonb({"page_content": doc.page_content, "metadata": doc.metadata}),
+                            to_vector_literal(vector),
+                        )
+                        for doc, vector in zip(batch, vectors, strict=True)
+                    ],
+                )
+            logger.info(
+                "build_index.progress",
+                indexed=min(start + batch_size, len(documents)),
+                total=len(documents),
+            )
+
+        promote_embeddings_build_table(conn)
 
     return len(documents)
 
@@ -163,7 +218,7 @@ def main() -> None:
     configure_logging()
     settings = Settings.load_for_ingest()
     count = build_index(settings)
-    print(f"Done. Indexed {count} chunks into {settings.vector_store_dir}.")
+    print(f"Done. Indexed {count} chunks into Postgres.")
 
 
 if __name__ == "__main__":

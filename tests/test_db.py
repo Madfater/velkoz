@@ -27,7 +27,6 @@ def _settings(rules_dir: str = "unused") -> IngestSettings:
         embedding_base_url="unused",
         embedding_api_key="unused",
         embedding_model="unused",
-        vector_store_dir="unused",
         rules_dir=rules_dir,
         database_url=DATABASE_URL,
     )

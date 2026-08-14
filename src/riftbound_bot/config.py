@@ -28,7 +28,7 @@ class Settings:
     retrieval_pool_per_type: int
     retrieval_k: int
     retrieval_score_threshold: float
-    vector_store_dir: str
+    database_url: str
 
     @classmethod
     def load(cls) -> Settings:
@@ -42,20 +42,20 @@ class Settings:
             retrieval_score_threshold=float(
                 os.environ.get("RETRIEVAL_SCORE_THRESHOLD", "0.45")
             ),
-            vector_store_dir=os.environ.get("VECTOR_STORE_DIR", "data/turbovec"),
+            database_url=_require("DATABASE_URL"),
         )
 
     @classmethod
     def load_for_ingest(cls) -> IngestSettings:
         """Ingestion only needs the embedding + storage config, not Discord/generation.
 
-        `database_url`/`rules_dir` are ingest-time only — the live bot never
-        touches Postgres or the rules Markdown source, only the built vector
-        store (see rag/vectorstore.py's load_vectorstore).
+        Both halves now share `database_url`: the vector index lives in the
+        `embeddings` table rather than a local directory, so the bot reads the
+        same database ingestion writes. `rules_dir` stays ingest-only — the
+        bot has never read the rules Markdown source.
         """
         return IngestSettings(
             **_embedding_settings_kwargs(),
-            vector_store_dir=os.environ.get("VECTOR_STORE_DIR", "data/turbovec"),
             rules_dir=os.environ.get("RULES_DIR", "data/rules"),
             database_url=_require("DATABASE_URL"),
         )
@@ -85,6 +85,5 @@ class IngestSettings:
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
-    vector_store_dir: str
     rules_dir: str
     database_url: str

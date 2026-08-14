@@ -10,7 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # Must match docker-compose.yml: the test suite runs ingest/db.py's
+        # CREATE EXTENSION vector, which stock postgres images don't ship.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: riftbound
           POSTGRES_PASSWORD: riftbound

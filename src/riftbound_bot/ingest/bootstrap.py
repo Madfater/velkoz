@@ -6,9 +6,9 @@ instead of one that crash-loops on a missing index until three ingest
 commands are run by hand in the right order.
 
 Every step is skip-if-already-done, so this is safe to run on every boot:
-a warm deployment does one file check and exits. That is what makes it
-usable as an init container rather than a one-off — it must stay cheap and
-idempotent, so think twice before adding a step that isn't both.
+a warm deployment does one query and exits. That is what makes it usable as
+an init container rather than a one-off — it must stay cheap and idempotent,
+so think twice before adding a step that isn't both.
 
 What it deliberately does *not* do is refresh anything already present.
 Re-scraping a third-party site and re-embedding ~1,300 documents on every
@@ -28,7 +28,7 @@ from riftbound_bot.ingest.cards_scrape import scrape_all_cards
 from riftbound_bot.ingest.db import CARDS_TABLE, get_connection, upsert_cards
 from riftbound_bot.ingest.rules_sync import sync_rules
 from riftbound_bot.logging_config import configure_logging
-from riftbound_bot.rag.vectorstore import index_exists
+from riftbound_bot.rag.vectorstore import index_populated
 
 logger = structlog.get_logger("riftbound_bot.bootstrap")
 
@@ -39,9 +39,9 @@ def _ensure_cards(settings) -> None:
     The scrape is the one step here that reaches a third-party site, and
     the one most likely to break (it reads chroniclecore.com's internal
     /gallery payload). Gating it on an empty table means the common
-    recovery case — index deleted, Postgres volume intact — rebuilds from
-    the cards already stored instead of depending on that site being up
-    and unchanged.
+    recovery case — embeddings dropped, `cards` intact — rebuilds from the
+    cards already stored instead of depending on that site being up and
+    unchanged.
     """
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
@@ -76,9 +76,10 @@ def _ensure_cards(settings) -> None:
 
 def bootstrap(settings) -> bool:
     """Returns True if it built the index, False if there was nothing to do."""
-    if index_exists(settings.vector_store_dir):
-        logger.info("bootstrap.index_present", path=settings.vector_store_dir)
-        return False
+    with get_connection(settings) as conn:
+        if index_populated(conn):
+            logger.info("bootstrap.index_present")
+            return False
 
     # Rules come from git-tracked Markdown in the image's bind-mounted
     # data/ — offline, cheap, and sync_rules already upserts-and-prunes to
@@ -88,7 +89,7 @@ def bootstrap(settings) -> bool:
     _ensure_cards(settings)
 
     count = build_index(settings)
-    logger.info("bootstrap.index_built", documents=count, path=settings.vector_store_dir)
+    logger.info("bootstrap.index_built", documents=count)
     return True
 
 
@@ -96,9 +97,9 @@ def main() -> None:
     configure_logging()
     settings = Settings.load_for_ingest()
     if bootstrap(settings):
-        print(f"Bootstrap complete. Index built at {settings.vector_store_dir}.")
+        print("Bootstrap complete. Index built in Postgres.")
     else:
-        print(f"Index already present at {settings.vector_store_dir}; nothing to do.")
+        print("Index already present in Postgres; nothing to do.")
 
 
 if __name__ == "__main__":

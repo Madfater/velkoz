@@ -12,14 +12,19 @@ import discord
 import structlog
 from discord import app_commands
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.vectorstores import VectorStore
 from openai import RateLimitError
+from psycopg_pool import ConnectionPool
 
 from riftbound_bot.config import Settings
 from riftbound_bot.logging_config import configure_logging
 from riftbound_bot.rag.chain import RagResult, RiftboundRagChain
 from riftbound_bot.rag.llm import build_chat_model
-from riftbound_bot.rag.vectorstore import build_embeddings, load_vectorstore
+from riftbound_bot.rag.vectorstore import (
+    PgVectorStore,
+    RetrievalStore,
+    build_embeddings,
+    index_populated,
+)
 
 logger = structlog.get_logger("riftbound_bot")
 
@@ -87,25 +92,39 @@ def _answer_embed(result: RagResult) -> discord.Embed:
     return embed
 
 
+def _connect_vectorstore(settings: Settings) -> PgVectorStore:
+    """Opens the pool and refuses to serve an unbuilt index.
+
+    The check is deliberately up front, at startup, rather than left to fail
+    per-request: a bot answering every question from an empty index looks
+    healthy while being uniformly wrong.
+    """
+    pool = ConnectionPool(settings.database_url, min_size=1, max_size=4, timeout=10)
+    with pool.connection() as conn:
+        if not index_populated(conn):
+            raise RuntimeError(
+                "No vector index in Postgres — run `python -m "
+                "riftbound_bot.ingest.bootstrap` first."
+            )
+    embeddings = build_embeddings(
+        base_url=settings.embedding_base_url,
+        api_key=settings.embedding_api_key,
+        model=settings.embedding_model,
+    )
+    return PgVectorStore(pool, embeddings)
+
+
 def build_client(
     settings: Settings,
-    vectorstore: VectorStore | None = None,
+    vectorstore: RetrievalStore | None = None,
     llm: BaseChatModel | None = None,
 ) -> RiftboundClient:
     """`vectorstore`/`llm` are injectable so tests can exercise the Discord
     command-registration/error-handling wiring here without needing a
-    reachable embedding endpoint — RiftboundRagChain's constructor does a
-    real embedding call even against an empty store (see chain.py's
-    _load_card_docs_by_name), unlike the old Chroma-backed lookup this
-    replaced, which was a pure metadata call with zero network I/O.
+    reachable database or embedding endpoint.
     """
     if vectorstore is None:
-        embeddings = build_embeddings(
-            base_url=settings.embedding_base_url,
-            api_key=settings.embedding_api_key,
-            model=settings.embedding_model,
-        )
-        vectorstore = load_vectorstore(settings.vector_store_dir, embeddings)
+        vectorstore = _connect_vectorstore(settings)
     if llm is None:
         llm = build_chat_model(
             base_url=settings.generation_base_url,

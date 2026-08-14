@@ -38,7 +38,12 @@ x-ingest-base: &ingest-base
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # pgvector's image, not stock postgres: the `embeddings` table is a
+    # `vector` column, and ingest/db.py's CREATE EXTENSION fails on an image
+    # that doesn't ship it. Same major version, so this is a drop-in swap for
+    # the schema — but not for an existing volume, which was initialized by
+    # the musl-based alpine image and must be recreated (`down -v`).
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-riftbound}

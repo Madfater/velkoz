@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 import structlog
 from langchain_core.documents import Document
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.vectorstores import VectorStore
 
 from riftbound_bot.rag.citations import format_citations
+from riftbound_bot.rag.vectorstore import RetrievalStore
 
 logger = structlog.get_logger("riftbound_bot.chain")
 
@@ -40,14 +40,6 @@ EXACT_MATCH_SCORE = float("inf")
 # k. Kept above 1-2 on purpose: the system prompt's own worked example
 # ("我打出 X，對手有 Y") names two cards at once.
 MAX_EXACT_MATCH_NAMES = 4
-
-# Upper bound for the "give me everything matching this filter" bulk-fetch
-# used at chain-construction time (see _load_card_docs_by_name /
-# _load_rule_chunks). TurboQuantVectorStore's similarity_search returns the
-# complete filtered set once k >= the candidate count — this just needs
-# comfortable headroom over the corpus (~1,300 documents today), not an
-# exact count.
-_BULK_FETCH_LIMIT = 20_000
 
 SYSTEM_PROMPT = """\
 你是一個 Riftbound（符文之地）集換式卡牌遊戲的規則裁判助手，服務對象是繁體中文玩家。
@@ -115,7 +107,7 @@ class RiftboundRagChain:
 
     def __init__(
         self,
-        vectorstore: VectorStore,
+        vectorstore: RetrievalStore,
         llm: BaseChatModel,
         pool_per_type: int = 10,
         k: int = 6,
@@ -134,23 +126,15 @@ class RiftboundRagChain:
         )
 
     def _load_card_docs_by_name(self) -> dict[str, list[Document]]:
-        """Loaded once from the vectorstore itself (not cards.json/Postgres) so
-        this can never drift from what's actually indexed and searchable.
+        """Loaded once from the indexed documents themselves (not the `cards`
+        table) so this can never drift from what's actually searchable.
 
-        Uses similarity_search with a throwaway query and a generous k rather
-        than Chroma's collection-level .get(where=...) — TurboVec's
-        TurboQuantVectorStore has no bulk filtered-fetch API, but
-        similarity_search returns the *complete* filtered set once k meets
-        or exceeds the candidate count (confirmed against the installed
-        package: the store builds an allow-list from every matching document
-        first, then returns min(k, n_allowed) results), so a large
-        _BULK_FETCH_LIMIT gets everything, unranked-order doesn't matter
-        here. Costs one throwaway embedding call, at chain-construction
-        (bot startup) time only — not per-request.
+        fetch_by_source_type is a plain filtered read with no query vector.
+        Under TurboVec this had to be faked with an empty query and a huge k,
+        because that store had no bulk filtered-fetch API — which cost a
+        throwaway embedding call per source type on every bot startup.
         """
-        docs = self.vectorstore.similarity_search(
-            "", k=_BULK_FETCH_LIMIT, filter={"source_type": "card"}
-        )
+        docs = self.vectorstore.fetch_by_source_type("card")
         by_name: dict[str, list[Document]] = {}
         for doc in docs:
             name = doc.metadata.get("name_zh")
@@ -160,9 +144,7 @@ class RiftboundRagChain:
         return by_name
 
     def _load_rule_chunks(self) -> list[Document]:
-        return self.vectorstore.similarity_search(
-            "", k=_BULK_FETCH_LIMIT, filter={"source_type": "rule"}
-        )
+        return self.vectorstore.fetch_by_source_type("rule")
 
     @staticmethod
     def _combine_subtree(root_id: str, title: str, chunks: list[Document]) -> Document:

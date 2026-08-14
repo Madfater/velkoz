@@ -7,13 +7,13 @@ dependencies = [
     "discord-py>=2.4",
     "langchain>=0.3",
     "langchain-openai>=0.2",
-    "turbovec[langchain]>=0.8.0",
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
     "structlog>=24.0",
     "tenacity>=9.0",
     "psycopg[binary]>=3.1",
+    "psycopg-pool>=3.2",
 ]
 
 [project.optional-dependencies]
