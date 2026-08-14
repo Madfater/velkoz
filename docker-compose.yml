@@ -4,6 +4,16 @@
 x-ingest-base: &ingest-base
   build: .
   image: ghcr.io/madfater/riftbound-bot:latest
+  # `build:` + a floating `:latest` tag is a trap on the deploy host: without
+  # this, compose's default policy is "use the local image if the tag exists"
+  # — so a host that pulled :latest once keeps running that layer forever and
+  # the CI push is silently ignored. The symptom is a container failing on
+  # code that exists in git ("No module named riftbound_bot.ingest.bootstrap").
+  # Force the pull so the deployed image always matches what CI published.
+  #
+  # Local `docker compose up` therefore also pulls GHCR rather than building;
+  # pass `--build` (or run `docker compose build`) to test local source.
+  pull_policy: always
   # These are the only containers that *write* to the bind-mounted ./data,
   # so they have to run as whoever owns it on the host. The image's own `app`
   # user (uid 999) can't: a bind mount keeps the host's ownership, shadowing
@@ -64,6 +74,7 @@ services:
   bot:
     build: .
     image: ghcr.io/madfater/riftbound-bot:latest
+    pull_policy: always  # same staleness trap as x-ingest-base above
     restart: unless-stopped
     env_file: .env
     volumes:
