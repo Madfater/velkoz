@@ -35,6 +35,7 @@ from riftbound_bot.ingest.db import (
     CARDS_TABLE,
     RULES_TABLE,
     get_connection,
+    update_card_images,
     upsert_cards,
 )
 from riftbound_bot.ingest.rules_import import import_chunks
@@ -93,19 +94,7 @@ def _ensure_cards(settings) -> None:
             logger.info("bootstrap.cards_present", count=existing)
             return
 
-        logger.info("bootstrap.cards_scrape_start")
-        try:
-            records = [card.__dict__ for card in scrape_all_cards()]
-            source = "scrape"
-        # Deliberately blind: the scrape parses a third-party site's internal
-        # payload, so it can fail as an HTTP error, a JSON error, or a
-        # KeyError on a renamed field. Enumerating those would just mean the
-        # one unlisted failure mode takes down a fresh deployment, which is
-        # exactly what the seed fallback exists to prevent.
-        except Exception as error:  # noqa: BLE001
-            logger.warning("bootstrap.cards_scrape_failed", error=str(error))
-            records = seeds.cards()
-            source = "seed"
+        records, source = _scrape_or_seed(reason="cards_table_empty")
 
         if not records:
             raise RuntimeError(
@@ -122,8 +111,80 @@ def _ensure_cards(settings) -> None:
         logger.info("bootstrap.cards_loaded", count=len(records), source=source)
 
 
+def _scrape_or_seed(reason: str) -> tuple[list[dict], str]:
+    """Fresh card records from the site, falling back to the bundled snapshot.
+
+    Shared by the two callers below because the failure argument is the same
+    in both: the scrape reads a third-party site's internal payload and can
+    fail as an HTTP error, a JSON error, or a KeyError on a renamed field.
+    Enumerating those would just mean the one unlisted failure mode takes down
+    the deployment, which is what the seed fallback exists to prevent.
+    """
+    logger.info("bootstrap.cards_scrape_start", reason=reason)
+    try:
+        return [card.__dict__ for card in scrape_all_cards()], "scrape"
+    except Exception as error:  # noqa: BLE001
+        logger.warning("bootstrap.cards_scrape_failed", error=str(error))
+        return seeds.cards(), "seed"
+
+
+def _ensure_card_images(settings) -> None:
+    """Backfills card images into rows stored before the scraper captured them.
+
+    This is the one step that refreshes data already present, which the module
+    docstring otherwise rules out — so it is worth saying why. /card renders a
+    card face, and card rows written before the scraper captured `assets` have
+    none, so without this the deploy that adds /card would leave every existing
+    deployment showing card embeds with a hole in them until an operator ran
+    the scrape by hand.
+
+    It writes *only* `image_url`, via update_card_images rather than
+    upsert_cards. A re-scrape also brings back renames and recategorizations,
+    and those feed the embedded text — writing them here, on the boot path that
+    then skips the index rebuild, would silently leave retrieval matching names
+    the cards table no longer holds. Keeping data current stays a deliberate
+    refresh; this repairs one field.
+
+    It stays honest about bootstrap's skip-if-already-done contract: the check
+    is a single count that returns zero forever after the first successful
+    backfill, so a warm deployment still does one query and exits.
+    """
+    with get_connection(settings) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT count(*) FROM {CARDS_TABLE} "
+                "WHERE coalesce(data->>'image_url', '') = ''"
+            )
+            missing = cur.fetchone()[0]
+        if not missing:
+            return
+
+        records, source = _scrape_or_seed(reason="cards_missing_images")
+        images = {
+            record["id"]: record.get("image_url", "")
+            for record in records
+            if record.get("id")
+        }
+        if not any(images.values()):
+            raise RuntimeError(
+                f"{missing} stored cards have no image, and neither the scrape "
+                "nor the bundled snapshot produced any. See docs/data-pipeline.md."
+            )
+        updated = update_card_images(conn, images)
+        logger.info(
+            "bootstrap.card_images_backfilled",
+            was_missing=missing,
+            updated=updated,
+            source=source,
+        )
+
+
 def bootstrap(settings) -> bool:
     """Returns True if it built the index, False if there was nothing to do."""
+    # Ahead of the index check on purpose: this has to run on warm deployments
+    # too, and those return early below.
+    _ensure_card_images(settings)
+
     with get_connection(settings) as conn:
         if index_populated(conn):
             logger.info("bootstrap.index_present")

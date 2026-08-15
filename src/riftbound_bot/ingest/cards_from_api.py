@@ -193,6 +193,7 @@ class ApiCard:
     power: int | None
     might: int | None
     tags: list[str] = field(default_factory=list)
+    image_url: str = ""
 
 
 def _expand_icons(text: str) -> str:
@@ -265,6 +266,7 @@ def _normalize_card(raw: dict[str, Any]) -> ApiCard:
     classification = raw.get("classification") or {}
     text = raw.get("text") or {}
     set_info = raw.get("set") or {}
+    media = raw.get("media") or {}
 
     set_code = str(set_info.get("set_id") or "")
     collector_number = str(raw.get("collector_number") or "").zfill(3)
@@ -284,6 +286,11 @@ def _normalize_card(raw: dict[str, Any]) -> ApiCard:
         power=attributes.get("power"),
         might=attributes.get("might"),
         tags=_map_tags(raw.get("tags") or []),
+        # Already absolute (Riot's own CDN), unlike the primary scraper's
+        # site-relative asset paths. This face is English — this source has no
+        # Chinese art at all, which is the same reason it needs an LLM to
+        # produce Chinese rules text.
+        image_url=str(media.get("image_url") or ""),
     )
 
 
@@ -383,6 +390,7 @@ def translate_all(
                     tags=card.tags,
                     rules_text_zh=text_zh,
                     source_url=CARD_URL_TEMPLATE.format(card_id=card.id),
+                    image_url=card.image_url,
                 )
             )
     return records

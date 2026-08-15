@@ -88,3 +88,36 @@ GENERATION_MODEL=claude-sonnet-5
 Any other OpenAI-API-compatible provider works the same way by pointing
 `GENERATION_API_BASE_URL` at it instead. `GENERATION_API_KEY` can stay blank for
 the free default.
+
+## `/card` reads the `cards` table, not the vector index
+
+**This deviates from the design doc,** which scoped the bot to one command.
+`/card` is a second one: exact card lookup by name, answered from stored data
+with no LLM in the path.
+
+It is also the first thing in the bot to read `cards` at request time — every
+other runtime query goes to `embeddings`. Serving it from the index instead
+would have been the smaller diff, and was rejected: embedding metadata
+deliberately carries only what retrieval needs (id, both names, rarity, source
+url), so energy/power/might/color/tags and the image would all have had to be
+added to it, and widening that metadata means re-embedding the whole corpus for
+data that has nothing to do with similarity search.
+
+The whole table is loaded into memory once at startup. At ~1,256 rows that is
+a fraction of a megabyte, and Discord's autocomplete contract requires it
+anyway: a callback that fires per keystroke inside a 3-second budget cannot
+afford a round trip per character. See
+[`cards.py`](../src/riftbound_bot/cards.py).
+
+## The bot refuses to start on card data with no images
+
+Card rows written before the scraper captured `assets` have no `image_url`, and
+`/card` exists to show a card face. Rendering the embed anyway would put a
+card-shaped hole in a channel and look like a bug in Discord rather than stale
+data, so `build_client` fails at boot with the command that fixes it.
+
+That guard would otherwise turn this change into a bot that won't start, so
+`bootstrap` backfills the field ahead of its index check — the one place it
+refreshes data already present, and it stops doing work as soon as the data is
+current. See `_ensure_card_images` in
+[`ingest/bootstrap.py`](../src/riftbound_bot/ingest/bootstrap.py).

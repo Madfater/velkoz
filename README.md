@@ -53,9 +53,15 @@ uv run riftbound-bot
 See [docs/data-pipeline.md](docs/data-pipeline.md) for the individual ingest
 steps, and for refreshing data once it's already populated.
 
-Then use `/ask` in your Discord server. The bot replies and spawns a thread from
-its own reply — any further message in that thread is treated as a follow-up with
-the prior Q&A as context.
+Two commands are available in your Discord server:
+
+- `/ask <question>` — a RAG-grounded answer about rules or card interactions. The
+  bot replies and spawns a thread from its own reply; any further message in that
+  thread is treated as a follow-up with the prior Q&A as context.
+- `/card <name>` — looks up one card and shows its stats and card face. Autocomplete
+  matches Chinese names, English names, and card ids at once (`巴凱旋沙者`,
+  `Sandspinner`, `VEN-001` all find the same card), so pick a row to disambiguate
+  the 188 Chinese names that more than one printing shares.
 
 ## Tests
 

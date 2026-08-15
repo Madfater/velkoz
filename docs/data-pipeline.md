@@ -125,13 +125,50 @@ just needs a rebuild rather than a setting kept in lockstep.
 `build_index.py` also prepends ancestor-heading context to each chunk before
 embedding it — see [retrieval-notes.md](retrieval-notes.md) for why.
 
+## Card images
+
+Card records carry an `image_url` — the card's face, which `/card` renders. It is
+read from the gallery payload's `assets.img_zh_hans`, **not** templated from the
+card id: 45 of the 1,256 cards have a filename the obvious
+`unified/{id}_sc.png` template gets wrong (ids ending in `*` are spelled `_star_`,
+so `VEN-189*` is `unified/VEN-189_star_sc.png`).
+
+It uses the `zh_hans` face because that is the only one present for all 1,256
+cards — `img_en` is missing for 68, mostly VEN promos and rune cards. The printed
+text on it is therefore Simplified while the rest of the bot is Traditional. That
+trade was made deliberately: an image that always resolves beats a matching script
+that sometimes leaves a hole where the card should be.
+
+`image_url` is deliberately absent from `CardRecord.text`, the string that gets
+embedded, so adding it did not invalidate a single vector.
+
+**The Riftcodex fallback yields English faces.** That source carries no Chinese
+art at all — the same reason it needs an LLM for Chinese rules text — so cards
+ingested through `cards_from_api` get Riot's English card image. Cards ingested
+that way therefore render an English face under Traditional Chinese text. That
+is a known degradation of the fallback path, not of `cards_scrape`.
+
+Cards stored before this field existed have no image, and the bot refuses to start
+on them rather than serving card embeds with a blank space. `bootstrap` repairs
+that automatically on the next boot (`_ensure_card_images`), so a normal `compose
+up` is enough; to do it by hand:
+
+```bash
+docker compose --profile tools run --rm ingest riftbound_bot.ingest.cards_scrape
+```
+
 ## Open follow-ups
 
-- Card data's top-level `tags` field (champion/region tags) comes from the source
-  site un-localized — some entries are Simplified rather than Traditional Chinese.
+- Re-scraping cards updates `cards` but not `embeddings`, so card-name corrections
+  reach `/card` immediately and `/ask` only after a `build_index` rebuild. The
+  2026-08 re-scrape renamed 19 cards (提摩 → 提摩-偵察兵) and recategorized 18
+  (指示物單位 → 衍生物單位); those are live for `/card` and stale for retrieval
+  until the index is rebuilt.
 - The rules corpus needs the rest of the Core Rules PDF transcribed (see above).
 - Rule 809.1.c.1's worked example says "一張渾沌（Fury）法術" — 渾沌 means Chaos, not
   Fury (Fury is 狂怒, per the rune cards' data). Pre-existing typo.
-- The card snapshot at `src/riftbound_bot/ingest/seeds/cards.json` is the original
-  scrape, and drifts further from the live site with every set. Re-running
-  `cards_scrape` and re-exporting it keeps the offline fallback useful.
+- The card snapshot at `src/riftbound_bot/ingest/seeds/cards.json` drifts further
+  from the live site with every set. Re-running `cards_scrape` and re-exporting it
+  keeps the offline fallback useful. Last refreshed 2026-08-15, which is also when
+  the source site's `tags` switched to Traditional Chinese — the un-localized tags
+  noted here previously are fixed as of that snapshot.
