@@ -186,6 +186,61 @@ def test_ensure_cards_falls_back_to_the_seed_when_the_scrape_breaks(conn, monkey
         assert cur.fetchone()[0] == len(seeds.cards())
 
 
+def test_ensure_card_images_backfills_cards_stored_without_one(conn, monkeypatch):
+    """Rows written before the scraper captured `assets` carry no image_url,
+    and build_client refuses to start on those — so the deploy that adds /card
+    has to repair them rather than leaving the bot unable to boot."""
+    upsert_cards(conn, [{"id": "C1", "name_zh": "卡一"}])
+
+    class FakeCard:
+        def __init__(self):
+            self.__dict__ = {"id": "C1", "name_zh": "卡一", "image_url": "https://x/C1.png"}
+
+    monkeypatch.setattr(bootstrap_module, "scrape_all_cards", lambda: [FakeCard()])
+
+    bootstrap_module._ensure_card_images(_settings())
+
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT data->>'image_url' FROM {CARDS_TABLE}")
+        assert [row[0] for row in cur.fetchall()] == ["https://x/C1.png"]
+
+
+def test_ensure_card_images_is_a_noop_once_every_card_has_one(conn, monkeypatch):
+    """It runs on every boot, warm ones included, so it must stop doing work
+    the moment the data is current — one count query and out."""
+    upsert_cards(conn, [{"id": "C1", "name_zh": "卡一", "image_url": "https://x/C1.png"}])
+
+    def fail():
+        raise AssertionError("should not reach the network when images are present")
+
+    monkeypatch.setattr(bootstrap_module, "scrape_all_cards", fail)
+    bootstrap_module._ensure_card_images(_settings())
+
+
+def test_ensure_card_images_ignores_an_empty_cards_table(conn, monkeypatch):
+    """A fresh database has no cards to backfill; seeding them is _ensure_cards'
+    job, further down."""
+    def fail():
+        raise AssertionError("an empty table is not a missing-image table")
+
+    monkeypatch.setattr(bootstrap_module, "scrape_all_cards", fail)
+    bootstrap_module._ensure_card_images(_settings())
+
+
+def test_bootstrap_backfills_images_even_when_the_index_is_already_built(conn, monkeypatch):
+    """The regression this guards: the index check returns early, so a backfill
+    placed after it would never run on the warm deployments that need it."""
+    _build_index_of(conn, [("rule:100", "rule")])
+    upsert_cards(conn, [{"id": "C1", "name_zh": "卡一"}])
+    calls = []
+    monkeypatch.setattr(
+        bootstrap_module, "_ensure_card_images", lambda s: calls.append("images")
+    )
+
+    assert bootstrap_module.bootstrap(_settings()) is False
+    assert calls == ["images"]
+
+
 def test_ensure_cards_points_at_the_paid_fallback_when_nothing_is_available(conn, monkeypatch):
     """cards_from_api costs real LLM calls, so bootstrap names it instead of
     silently running it."""
