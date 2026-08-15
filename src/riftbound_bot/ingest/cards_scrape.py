@@ -15,6 +15,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urljoin
 
 import httpx
 from tenacity import (
@@ -24,6 +25,7 @@ from tenacity import (
     wait_exponential,
 )
 
+SITE_BASE_URL = "https://riftbound.chroniclecore.com/"
 GALLERY_URL = "https://riftbound.chroniclecore.com/gallery"
 CARD_URL_TEMPLATE = "https://riftbound.chroniclecore.com/cards/{card_id}"
 
@@ -52,6 +54,7 @@ class CardRecord:
     tags: list[str]
     rules_text_zh: str
     source_url: str
+    image_url: str = ""
 
     @property
     def text(self) -> str:
@@ -75,6 +78,27 @@ class CardRecord:
 def _clean_effect_text(raw: str) -> str:
     """Strips the site's `{{keyword}}` highlight markup down to plain text."""
     return _KEYWORD_MARKUP_RE.sub(r"\1", raw).strip()
+
+
+def _image_url(raw: dict) -> str:
+    """Absolute URL of the card's face image, from the payload's `assets` block.
+
+    Read out of the payload rather than templated from the card id, because
+    the mapping is not mechanical: 45 of the 1,256 cards carry a path that
+    `unified/{id}_sc.png` would get wrong — ids ending in `*` become `_star_`
+    (`VEN-189*` -> `unified/VEN-189_star_sc.png`), so a template would 404 on
+    every one of them.
+
+    Uses the `zh_hans` face: it is the only one present for all 1,256 cards
+    (`img_en` is missing for 68, mostly VEN promos and rune cards). Its
+    printed text is Simplified while the rest of the bot is Traditional —
+    accepted deliberately, since an image that always resolves beats a
+    matching script that sometimes leaves a blank space where the card
+    should be.
+    """
+    assets = raw.get("assets") or {}
+    path = assets.get("img_zh_hans") or ""
+    return urljoin(SITE_BASE_URL, path) if path else ""
 
 
 @retry(
@@ -168,6 +192,7 @@ def normalize_card(raw: dict) -> CardRecord:
         tags=raw.get("tags") or [],
         rules_text_zh=_clean_effect_text(zh_hant.get("effect", "")),
         source_url=CARD_URL_TEMPLATE.format(card_id=card_id),
+        image_url=_image_url(raw),
     )
 
 

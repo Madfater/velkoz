@@ -79,6 +79,20 @@ def test_normalize_maps_onto_the_primary_sources_vocabulary():
     assert (card.energy, card.might, card.power) == (3, 2, None)
 
 
+def test_normalize_carries_the_media_image_url_through():
+    # Already absolute here (Riot's CDN), unlike the primary scraper's
+    # site-relative asset paths — both sources have to land an image in the
+    # same column, because /card refuses to render a card without one.
+    card = _normalize_card(
+        _raw_card(media={"image_url": "https://cmsassets.rgpub.io/x-744x1039.png"})
+    )
+    assert card.image_url == "https://cmsassets.rgpub.io/x-744x1039.png"
+
+
+def test_normalize_leaves_the_image_empty_when_the_api_omits_media():
+    assert _normalize_card(_raw_card()).image_url == ""
+
+
 def test_dual_domain_cards_keep_both_colours():
     card = _normalize_card(
         _raw_card(classification={"type": "Legend", "rarity": "Rare", "domain": ["Fury", "Chaos"]})
