@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import structlog
+from psycopg_pool import ConnectionPool
 
 from riftbound_bot.ingest.db import CARDS_TABLE
 
@@ -115,7 +116,7 @@ class CardSource(Protocol):
 class PgCardSource:
     """Reads every row of `cards`, once, through the bot's existing pool."""
 
-    def __init__(self, pool):
+    def __init__(self, pool: ConnectionPool) -> None:
         self._pool = pool
 
     def fetch_all_cards(self) -> list[dict]:
@@ -124,7 +125,7 @@ class PgCardSource:
             return [row[0] for row in cur.fetchall()]
 
 
-def _sort_key(card: Card, query: str) -> tuple:
+def _sort_key(card: Card, query: str) -> tuple[bool, int, bool, str]:
     """Ranks one match: prefix hits first, then shorter names, then base art.
 
     Prefix before substring is what makes typing feel like completion rather
@@ -154,7 +155,7 @@ class CardCatalog:
         logger.info(
             "cards.catalog_loaded",
             cards=len(catalog),
-            without_image=sum(1 for card in catalog._cards if not card.image_url),
+            without_image=catalog.cards_missing_images,
         )
         return catalog
 

@@ -326,7 +326,7 @@ def test_card_autocomplete_offers_card_ids_as_choice_values(tmp_path):
     card = client.tree.get_command("card")
     interaction = FakeInteraction(FakeMessage())
 
-    choices = asyncio.run(_autocomplete(card)(interaction,"巴凱"))
+    choices = asyncio.run(_autocomplete(card)(interaction, "巴凱"))
 
     assert [(c.name, c.value) for c in choices] == [
         ("巴凱旋沙者（Baccai Sandspinner） · VEN-001", "VEN-001")
@@ -338,7 +338,7 @@ def test_card_autocomplete_matches_english_names_too(tmp_path):
     card = client.tree.get_command("card")
     interaction = FakeInteraction(FakeMessage())
 
-    choices = asyncio.run(_autocomplete(card)(interaction,"poro"))
+    choices = asyncio.run(_autocomplete(card)(interaction, "poro"))
 
     assert [c.value for c in choices] == ["UNL-224"]
 

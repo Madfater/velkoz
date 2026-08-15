@@ -142,6 +142,12 @@ that sometimes leaves a hole where the card should be.
 `image_url` is deliberately absent from `CardRecord.text`, the string that gets
 embedded, so adding it did not invalidate a single vector.
 
+**The Riftcodex fallback yields English faces.** That source carries no Chinese
+art at all — the same reason it needs an LLM for Chinese rules text — so cards
+ingested through `cards_from_api` get Riot's English card image. Cards ingested
+that way therefore render an English face under Traditional Chinese text. That
+is a known degradation of the fallback path, not of `cards_scrape`.
+
 Cards stored before this field existed have no image, and the bot refuses to start
 on them rather than serving card embeds with a blank space. `bootstrap` repairs
 that automatically on the next boot (`_ensure_card_images`), so a normal `compose
