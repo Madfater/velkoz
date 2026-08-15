@@ -79,6 +79,33 @@ def upsert_cards(conn: psycopg.Connection, cards: list[dict]) -> None:
         cur.executemany(_UPSERT_CARD_SQL, [(card["id"], Jsonb(card)) for card in cards])
 
 
+def update_card_images(conn: psycopg.Connection, images: dict[str, str]) -> int:
+    """Sets `image_url` on stored cards, touching no other field.
+
+    Deliberately not `upsert_cards`: a re-scrape brings back renames,
+    recategorizations and retranslated tags along with the images, and all of
+    those feed `CardRecord.text` — the string that gets embedded. Writing them
+    without also rebuilding the index would leave retrieval matching against
+    names the `cards` table no longer holds. A backfill should repair the one
+    field it is named for and leave the rest for a deliberate refresh.
+
+    Only fills the gap, never overwrites an image already stored, so re-running
+    it cannot revert a hand-corrected URL.
+    """
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"""
+            UPDATE {CARDS_TABLE}
+            -- Explicit ::text because jsonb_build_object is variadic "any",
+            -- so Postgres cannot infer a bare parameter's type here.
+            SET data = data || jsonb_build_object('image_url', %s::text)
+            WHERE id = %s AND coalesce(data->>'image_url', '') = ''
+            """,
+            [(url, card_id) for card_id, url in images.items() if url],
+        )
+        return cur.rowcount
+
+
 def embedding_dimension(conn: psycopg.Connection, table: str = EMBEDDINGS_TABLE) -> int | None:
     """Vector width of `table`'s embedding column, or None if it doesn't exist.
 

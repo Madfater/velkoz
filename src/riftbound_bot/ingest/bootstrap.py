@@ -35,6 +35,7 @@ from riftbound_bot.ingest.db import (
     CARDS_TABLE,
     RULES_TABLE,
     get_connection,
+    update_card_images,
     upsert_cards,
 )
 from riftbound_bot.ingest.rules_import import import_chunks
@@ -132,15 +133,21 @@ def _ensure_card_images(settings) -> None:
 
     This is the one step that refreshes data already present, which the module
     docstring otherwise rules out — so it is worth saying why. /card renders a
-    card face, and build_client refuses to start when the stored cards have no
-    image_url, on the grounds that a card embed with a hole where the card
-    should be is worse than a clear startup error. Without this backfill, that
-    guard would turn the deploy that adds /card into a bot that won't boot,
-    fixable only by an operator running the scrape by hand.
+    card face, and card rows written before the scraper captured `assets` have
+    none, so without this the deploy that adds /card would leave every existing
+    deployment showing card embeds with a hole in them until an operator ran
+    the scrape by hand.
+
+    It writes *only* `image_url`, via update_card_images rather than
+    upsert_cards. A re-scrape also brings back renames and recategorizations,
+    and those feed the embedded text — writing them here, on the boot path that
+    then skips the index rebuild, would silently leave retrieval matching names
+    the cards table no longer holds. Keeping data current stays a deliberate
+    refresh; this repairs one field.
 
     It stays honest about bootstrap's skip-if-already-done contract: the check
-    is a single indexed-free count that returns zero forever after the first
-    successful backfill, so a warm deployment still does one query and exits.
+    is a single count that returns zero forever after the first successful
+    backfill, so a warm deployment still does one query and exits.
     """
     with get_connection(settings) as conn:
         with conn.cursor() as cur:
@@ -153,17 +160,21 @@ def _ensure_card_images(settings) -> None:
             return
 
         records, source = _scrape_or_seed(reason="cards_missing_images")
-        if not records:
+        images = {
+            record["id"]: record.get("image_url", "")
+            for record in records
+            if record.get("id")
+        }
+        if not any(images.values()):
             raise RuntimeError(
                 f"{missing} stored cards have no image, and neither the scrape "
-                "nor the bundled snapshot produced replacements. See "
-                "docs/data-pipeline.md."
+                "nor the bundled snapshot produced any. See docs/data-pipeline.md."
             )
-        upsert_cards(conn, records)
+        updated = update_card_images(conn, images)
         logger.info(
             "bootstrap.card_images_backfilled",
             was_missing=missing,
-            refreshed=len(records),
+            updated=updated,
             source=source,
         )
 
