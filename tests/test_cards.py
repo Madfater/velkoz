@@ -6,6 +6,9 @@ Chinese card names that more than one card shares.
 """
 from __future__ import annotations
 
+import pytest
+
+from riftbound_bot.bot import _load_catalog
 from riftbound_bot.cards import Card, CardCatalog
 
 
@@ -182,6 +185,36 @@ def test_catalog_reports_cards_that_have_no_image():
         [make_card("VEN-001", "甲"), make_card("VEN-002", "乙", image_url="")]
     )
 
+    assert catalog.cards_missing_images == 1
+
+
+def test_load_catalog_refuses_data_where_no_card_has_an_image():
+    """That is the signature of card rows written before image capture, and
+    the case bootstrap's backfill repairs."""
+    source = FakeCardSource([{"id": "VEN-001", "name_zh": "甲"}])
+
+    with pytest.raises(RuntimeError, match="predates image capture"):
+        _load_catalog(source)
+
+
+def test_load_catalog_refuses_an_empty_cards_table():
+    with pytest.raises(RuntimeError, match="No cards in Postgres"):
+        _load_catalog(FakeCardSource([]))
+
+
+def test_load_catalog_serves_data_where_only_some_images_are_missing():
+    """Upstream missing art for a few cards is not a reason to take /ask down
+    with /card — those render without an image."""
+    source = FakeCardSource(
+        [
+            {"id": "VEN-001", "name_zh": "甲", "image_url": "https://x/1.png"},
+            {"id": "VEN-002", "name_zh": "乙"},
+        ]
+    )
+
+    catalog = _load_catalog(source)
+
+    assert len(catalog) == 2
     assert catalog.cards_missing_images == 1
 
 

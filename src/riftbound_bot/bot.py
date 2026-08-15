@@ -21,13 +21,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from openai import RateLimitError
 from psycopg_pool import ConnectionPool
 
-from riftbound_bot.cards import (
-    MAX_AUTOCOMPLETE_CHOICES,
-    Card,
-    CardCatalog,
-    CardSource,
-    PgCardSource,
-)
+from riftbound_bot.cards import Card, CardCatalog, CardSource, PgCardSource
 from riftbound_bot.config import Settings
 from riftbound_bot.logging_config import configure_logging
 from riftbound_bot.rag.chain import RagResult, RiftboundRagChain
@@ -45,26 +39,18 @@ MAX_HISTORY_TURNS = 6
 EMBED_COLOR = 0xC89B3C  # Riftbound-adjacent gold
 MAX_EMBED_DESCRIPTION = 4096
 
-# Riftbound's six domains plus colourless, as embed stripe colours. Keyed on
-# the English colour word the card data stores, not the Chinese domain name.
-_DOMAIN_EMBED_COLORS = {
-    "red": 0xC0392B,
-    "blue": 0x2E86C1,
-    "green": 0x27916B,
-    "purple": 0x7D3C98,
-    "orange": 0xD35400,
-    "yellow": 0xD4AC0D,
-    "colorless": 0x95A5A6,
-}
-
-_DOMAIN_NAMES_ZH = {
-    "red": "紅色",
-    "blue": "藍色",
-    "green": "綠色",
-    "purple": "紫色",
-    "orange": "橙色",
-    "yellow": "黃色",
-    "colorless": "無色",
+# Riftbound's six domains plus colourless, as (embed stripe, display name).
+# Keyed on the English colour word the card data stores, not the Chinese
+# domain name — one map rather than two so a new domain can't be added to the
+# colours and forgotten in the names.
+_DOMAINS = {
+    "red": (0xC0392B, "紅色"),
+    "blue": (0x2E86C1, "藍色"),
+    "green": (0x27916B, "綠色"),
+    "purple": (0x7D3C98, "紫色"),
+    "orange": (0xD35400, "橙色"),
+    "yellow": (0xD4AC0D, "黃色"),
+    "colorless": (0x95A5A6, "無色"),
 }
 
 
@@ -170,7 +156,8 @@ def _card_color(card: Card) -> int:
     colour, so it takes the first — the domain the card is listed under.
     """
     primary = card.color.split("/")[0].strip().lower()
-    return _DOMAIN_EMBED_COLORS.get(primary, EMBED_COLOR)
+    stripe, _name = _DOMAINS.get(primary, (EMBED_COLOR, ""))
+    return stripe
 
 
 def _card_stat_fields(card: Card) -> list[tuple[str, str]]:
@@ -188,8 +175,11 @@ def _card_stat_fields(card: Card) -> list[tuple[str, str]]:
 
 
 def _color_zh(color: str) -> str:
+    """"red/purple" -> "紅色／紫色", leaving anything unrecognised as it stands."""
     return "／".join(
-        _DOMAIN_NAMES_ZH.get(part.strip().lower(), part) for part in color.split("/") if part
+        _DOMAINS.get(part.strip().lower(), (0, part))[1]
+        for part in color.split("/")
+        if part
     )
 
 
@@ -218,14 +208,18 @@ def _connect_pool(settings: Settings) -> ConnectionPool:
 
 
 def _load_catalog(source: CardSource) -> CardCatalog:
-    """Loads the card catalog, refusing card data too old to have images.
+    """Loads the card catalog, refusing card data too old to have images at all.
 
-    Same up-front-failure argument as the index check above, and the same
-    failure mode it guards against: `cards` rows written before the scraper
-    captured `assets` carry no image_url, so /card would answer every lookup
-    with a card-shaped embed and a conspicuous hole where the card should be.
-    Better to refuse at boot, naming the command that fixes it, than to ship
-    that to a channel.
+    Same up-front-failure argument as the index check above: /card exists to
+    show a card face, so data that predates image capture would answer every
+    lookup with a card-shaped embed and a conspicuous hole in it, which reads
+    as a bug in Discord rather than as stale data.
+
+    The line is drawn at *every* card missing one, because that is the only
+    case that means "this data is the wrong vintage" — and it is the case
+    bootstrap's backfill repairs. A handful of gaps means upstream is missing
+    art for a few cards, which is not a reason to take /ask down too; those
+    render without an image and are counted in the log instead.
     """
     catalog = CardCatalog.from_source(source)
     if not len(catalog):
@@ -233,11 +227,17 @@ def _load_catalog(source: CardSource) -> CardCatalog:
             "No cards in Postgres — run `python -m "
             "riftbound_bot.ingest.bootstrap` first."
         )
-    if catalog.cards_missing_images:
+    if catalog.cards_missing_images == len(catalog):
         raise RuntimeError(
-            f"{catalog.cards_missing_images} of {len(catalog)} cards have no "
-            "image_url — this card data predates image capture. Re-run "
-            "`python -m riftbound_bot.ingest.cards_scrape` to refresh it."
+            f"None of the {len(catalog)} stored cards have an image_url — this "
+            "card data predates image capture. Re-run `python -m "
+            "riftbound_bot.ingest.cards_scrape` to refresh it."
+        )
+    if catalog.cards_missing_images:
+        logger.warning(
+            "bot.cards_missing_images",
+            missing=catalog.cards_missing_images,
+            total=len(catalog),
         )
     return catalog
 
@@ -269,6 +269,8 @@ def build_client(
             if catalog is None:
                 catalog = _load_catalog(PgCardSource(pool))
         except BaseException:
+            # Same reason _connect_pool closes on the way out: the pool's
+            # worker threads outlive a failed startup and bury the real error.
             pool.close()
             raise
     if llm is None:
@@ -354,7 +356,7 @@ def build_client(
         """
         return [
             app_commands.Choice(name=found.choice_label(), value=found.id)
-            for found in client.catalog.search(current, limit=MAX_AUTOCOMPLETE_CHOICES)
+            for found in client.catalog.search(current)
         ]
 
     @card.error
